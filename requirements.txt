@@ -1,0 +1,9 @@
+# Core simulation runtime
+numpy>=1.24,<3
+numba>=0.57,<1
+
+# Optional progress display (used when progress=True)
+tqdm>=4.65,<5
+
+# Notebook plotting and analysis
+matplotlib>=3.7,<4

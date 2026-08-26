@@ -1,0 +1,11 @@
+# Virtual environment
+MSvenv/
+venv/
+.venv/
+
+# PDFs
+*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
