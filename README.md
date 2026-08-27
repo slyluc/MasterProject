@@ -112,3 +112,24 @@ MS.show_results(results)
 state = MS.load_checkpoint("checkpoints/base_run")
 MS.show_results(state)
 ```
+
+Add the number of spatial species patches on a separate right-hand y-axis:
+
+```python
+MS.show_results(state, show_patchiness=True)
+```
+
+The patchiness series is calculated from the sibling checkpoint lattices. A
+patch is one four-neighbour connected region of a species, including
+connections across the periodic lattice edges. Empty and blocked sites are
+not counted. The patchiness curve starts at the first available checkpoint,
+which can be later than the first diversity record. If checkpoint metadata is
+unavailable, provide the folder explicitly:
+
+```python
+MS.show_results(
+    results,
+    show_patchiness=True,
+    checkpoint_dir="checkpoints/base_run",
+)
+```

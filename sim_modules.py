@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.ticker import StrMethodFormatter
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -1313,10 +1314,185 @@ def percolation_simulation(
     return result
 
 
-def show_results(results):
+@njit(cache=True)
+def _patch_root(parent, site):
+    """Return a union-find root while shortening the traversed path."""
+    while parent[site] != site:
+        parent[site] = parent[parent[site]]
+        site = parent[site]
+    return site
+
+
+@njit(cache=True)
+def _merge_patch_sites(parent, sizes, first, second):
+    """Merge two union-find components and report whether they differed."""
+    first_root = _patch_root(parent, first)
+    second_root = _patch_root(parent, second)
+    if first_root == second_root:
+        return False
+    if sizes[first_root] < sizes[second_root]:
+        first_root, second_root = second_root, first_root
+    parent[second_root] = first_root
+    sizes[first_root] += sizes[second_root]
+    return True
+
+
+@njit(cache=True)
+def _count_lattice_patches(lattice):
+    """Count same-species components with four-neighbour periodic edges."""
+    rows, columns = lattice.shape
+    total_sites = lattice.size
+    parent = np.arange(total_sites, dtype=np.int64)
+    sizes = np.ones(total_sites, dtype=np.int64)
+    patches = 0
+
+    for row in range(rows):
+        for column in range(columns):
+            species = lattice[row, column]
+            if species <= 0:
+                continue
+
+            patches += 1
+            site = row * columns + column
+            right_column = 0 if column + 1 == columns else column + 1
+            if lattice[row, right_column] == species:
+                right_site = row * columns + right_column
+                if _merge_patch_sites(parent, sizes, site, right_site):
+                    patches -= 1
+
+            down_row = 0 if row + 1 == rows else row + 1
+            if lattice[down_row, column] == species:
+                down_site = down_row * columns + column
+                if _merge_patch_sites(parent, sizes, site, down_site):
+                    patches -= 1
+
+    return patches
+
+
+def count_patches(lattice):
+    """Return the number of spatial species patches in a lattice.
+
+    A patch is a maximal four-neighbour connected region occupied by one
+    positive species ID. Connections wrap across the periodic lattice edges;
+    empty (0) and blocked (-1) sites are not counted.
+    """
+    lattice = np.asarray(lattice)
+    if lattice.ndim != 2:
+        raise ValueError("lattice must be two-dimensional")
+    if not lattice.size:
+        raise ValueError("lattice cannot be empty")
+    if not np.issubdtype(lattice.dtype, np.integer):
+        raise TypeError("lattice must contain integers")
+    return int(_count_lattice_patches(lattice))
+
+
+def _patchiness_checkpoint_files(results, checkpoint_dir=None):
+    """Find the snapshots available for a patchiness time series."""
+    if checkpoint_dir is not None:
+        source = Path(checkpoint_dir).expanduser()
+        if source.is_dir():
+            candidates = list(source.glob("checkpoint_*.npz"))
+        elif source.is_file():
+            candidates = [source]
+        else:
+            raise FileNotFoundError(f"checkpoint path not found: {source}")
+    else:
+        checkpoint_files = results.get("checkpoint_files", ())
+        if checkpoint_files:
+            directories = {
+                Path(path).expanduser().parent for path in checkpoint_files
+            }
+            candidates = [
+                path
+                for directory in directories
+                for path in directory.glob("checkpoint_*.npz")
+            ]
+        elif results.get("checkpoint_path"):
+            checkpoint_path = Path(results["checkpoint_path"]).expanduser()
+            candidates = list(
+                checkpoint_path.parent.glob("checkpoint_*.npz")
+            )
+        else:
+            raise ValueError(
+                "show_patchiness=True requires checkpoints; pass "
+                "checkpoint_dir or use a result/state that contains "
+                "checkpoint metadata"
+            )
+
+    unique_candidates = {str(path.resolve()): path for path in candidates}
+    checkpoint_files = sorted(
+        unique_candidates.values(), key=_checkpoint_timestep
+    )
+    if not checkpoint_files:
+        raise FileNotFoundError("no checkpoint_*.npz files found")
+    return checkpoint_files
+
+
+def _load_patchiness_history(results, checkpoint_dir=None):
+    """Count patches in each available snapshot through the result time."""
+    checkpoint_files = _patchiness_checkpoint_files(
+        results, checkpoint_dir=checkpoint_dir
+    )
+    expected_shape = np.asarray(results["lattice"]).shape
+    result_timestep = results.get("timestep")
+    if result_timestep is None:
+        result_timestep = np.asarray(results["tracked_timesteps"])[-1]
+    result_timestep = int(result_timestep)
+
+    patches_by_timestep = {}
+    for checkpoint_file in checkpoint_files:
+        with np.load(checkpoint_file, allow_pickle=False) as saved:
+            missing = {"lattice", "timestep"}.difference(saved.files)
+            if missing:
+                raise ValueError(
+                    f"checkpoint {checkpoint_file} is missing: "
+                    f"{', '.join(sorted(missing))}"
+                )
+            timestep = int(saved["timestep"])
+            if timestep > result_timestep:
+                continue
+            checkpoint_lattice = saved["lattice"]
+            if checkpoint_lattice.shape != expected_shape:
+                raise ValueError(
+                    f"checkpoint {checkpoint_file} has lattice shape "
+                    f"{checkpoint_lattice.shape}; expected {expected_shape}"
+                )
+            patches_by_timestep[timestep] = count_patches(
+                checkpoint_lattice
+            )
+
+    if not patches_by_timestep:
+        raise ValueError(
+            "no checkpoint snapshots are available through the result time"
+        )
+    timesteps = np.asarray(sorted(patches_by_timestep), dtype=np.int64)
+    patchiness = np.asarray(
+        [patches_by_timestep[timestep] for timestep in timesteps],
+        dtype=np.int64,
+    )
+    return timesteps, patchiness
+
+
+def show_results(results, show_patchiness=False, checkpoint_dir=None):
+    """Plot the final lattice and diversity, optionally with patchiness.
+
+    When ``show_patchiness`` is true, patch counts are calculated from the
+    available checkpoint lattices and drawn against a separate right-hand
+    y-axis. ``checkpoint_dir`` can explicitly name a checkpoint directory or
+    file; otherwise checkpoint metadata in ``results`` is used.
+    """
+    if not isinstance(show_patchiness, (bool, np.bool_)):
+        raise TypeError("show_patchiness must be True or False")
+
     lattice = results["lattice"]
     species_ids = np.unique(lattice[lattice > 0])
     number_of_species = species_ids.size
+
+    patchiness_history = None
+    if show_patchiness:
+        patchiness_history = _load_patchiness_history(
+            results, checkpoint_dir=checkpoint_dir
+        )
 
     # Compact historical IDs so every currently living species gets a color.
     display_lattice = np.ones(lattice.shape, dtype=np.int32)  # Empty = 1
@@ -1340,11 +1516,36 @@ def show_results(results):
     ax_lattice.set_title(f"Final lattice: {number_of_species:,} living species")
     ax_lattice.set_axis_off()
 
-    ax_diversity.plot(
-        results["tracked_timesteps"], results["diversity_history"], lw=1.5
+    diversity_line, = ax_diversity.plot(
+        results["tracked_timesteps"],
+        results["diversity_history"],
+        color="tab:blue",
+        label="Living species",
+        lw=1.5,
     )
     ax_diversity.set(xlabel="Timestep", ylabel="Living species", title="Diversity")
     ax_diversity.grid(alpha=0.25)
+
+    if patchiness_history is not None:
+        patch_timesteps, patch_counts = patchiness_history
+        ax_patchiness = ax_diversity.twinx()
+        patchiness_line, = ax_patchiness.plot(
+            patch_timesteps,
+            patch_counts,
+            color="tab:orange",
+            label="Species patches",
+            lw=1.5,
+        )
+        ax_patchiness.set_ylabel("Species patches", color="tab:orange")
+        ax_patchiness.tick_params(axis="y", labelcolor="tab:orange")
+        ax_patchiness.yaxis.set_major_formatter(
+            StrMethodFormatter("{x:,.0f}")
+        )
+        ax_diversity.set_title("Diversity and patchiness")
+        ax_diversity.legend(
+            handles=[diversity_line, patchiness_line], loc="best"
+        )
+
     plt.tight_layout()
     plt.show()
 
