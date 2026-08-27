@@ -170,6 +170,96 @@ class ShowResultsPatchinessTests(unittest.TestCase):
 
         self.assertEqual(len(plt.gcf().axes), 2)
 
+    def test_requested_lattice_uses_nearest_checkpoint_and_full_histories(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            self._write_test_checkpoints(directory)
+            results = MS.load_checkpoint(directory)
+
+            with patch.object(MS.plt, "show"):
+                MS.show_results(
+                    results,
+                    show_patchiness=True,
+                    lattice_timestep=1.25,
+                )
+
+        figure = plt.gcf()
+        lattice_axis, diversity_axis, patchiness_axis = figure.axes
+        self.assertIn("timestep 1", lattice_axis.get_title())
+        self.assertIn("1 living species", lattice_axis.get_title())
+        np.testing.assert_array_equal(
+            lattice_axis.images[0].get_array(),
+            np.full((2, 2), 2, dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            diversity_axis.lines[0].get_xdata(), [0, 1, 2]
+        )
+        np.testing.assert_array_equal(
+            diversity_axis.lines[0].get_ydata(), [1, 1, 2]
+        )
+        np.testing.assert_array_equal(
+            patchiness_axis.lines[0].get_xdata(), [1, 2]
+        )
+        np.testing.assert_array_equal(
+            patchiness_axis.lines[0].get_ydata(), [1, 4]
+        )
+
+    def test_nearest_lattice_tie_uses_earlier_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            self._write_test_checkpoints(directory)
+            results = MS.load_checkpoint(directory)
+
+            lattice, timestep = MS._load_lattice_snapshot(
+                results, 1.5
+            )
+
+        self.assertEqual(timestep, 1)
+        np.testing.assert_array_equal(lattice, np.ones((2, 2)))
+
+    def test_later_sibling_is_not_used_for_older_result(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            first, _ = self._write_test_checkpoints(directory)
+            results = MS.load_checkpoint(first)
+
+            lattice, timestep = MS._load_lattice_snapshot(results, 2)
+
+        self.assertEqual(timestep, 1)
+        np.testing.assert_array_equal(lattice, results["lattice"])
+
+    def test_historical_lattice_requires_checkpoint_information(self):
+        results = self._checkpoint_state(
+            np.ones((2, 2), dtype=np.int64), 2, [1, 1, 1]
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires checkpoints"):
+            MS._load_lattice_snapshot(results, 1)
+
+    def test_request_after_result_uses_final_lattice_without_checkpoints(self):
+        results = self._checkpoint_state(
+            np.ones((2, 2), dtype=np.int64), 2, [1, 1, 1]
+        )
+
+        lattice, timestep = MS._load_lattice_snapshot(results, 3)
+
+        self.assertEqual(timestep, 2)
+        np.testing.assert_array_equal(lattice, results["lattice"])
+
+    def test_lattice_timestep_validation(self):
+        results = self._checkpoint_state(
+            np.ones((2, 2), dtype=np.int64), 2, [1, 1, 1]
+        )
+
+        for value in (True, "1"):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    MS._load_lattice_snapshot(results, value)
+        for value in (-1, np.nan, np.inf):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    MS._load_lattice_snapshot(results, value)
+
     def test_enabled_plot_requires_checkpoint_information(self):
         results = self._checkpoint_state(
             np.ones((2, 2), dtype=np.int64), 1, [1, 1]
@@ -186,6 +276,156 @@ class ShowResultsPatchinessTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "must be True or False"):
             MS.show_results(results, show_patchiness="yes")
+
+
+class AnimateLatticeTests(unittest.TestCase):
+    def tearDown(self):
+        plt.close("all")
+
+    @staticmethod
+    def _checkpoint_state(lattice, timestep, diversity_history):
+        return ShowResultsPatchinessTests._checkpoint_state(
+            lattice, timestep, diversity_history
+        )
+
+    @staticmethod
+    def _write_test_checkpoints(directory):
+        return ShowResultsPatchinessTests._write_test_checkpoints(directory)
+
+    def test_animation_uses_ordered_frames_and_stable_species_colors(self):
+        from matplotlib.animation import FuncAnimation
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            self._write_test_checkpoints(directory)
+
+            animation = MS.animate_lattice(directory, display=False)
+            self.assertIsInstance(animation, FuncAnimation)
+            self.assertEqual(animation._save_count, 2)
+
+            first_artists = animation._init_func()
+            first_colors = np.asarray(
+                first_artists[0].get_array()
+            ).copy()
+            second_artists = animation._func(1)
+            second_colors = np.asarray(
+                second_artists[0].get_array()
+            ).copy()
+
+        np.testing.assert_array_equal(
+            first_colors[0, 0], second_colors[0, 0]
+        )
+        self.assertFalse(
+            np.array_equal(first_colors[0, 1], second_colors[0, 1])
+        )
+        self.assertIn("timestep 2", second_artists[1].get_text())
+        self.assertIn("2 living species", second_artists[1].get_text())
+        animation._draw_was_started = True
+
+    def test_animation_stride_always_keeps_endpoint(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            for timestep in range(1, 5):
+                state = self._checkpoint_state(
+                    np.full((2, 2), timestep, dtype=np.int64),
+                    timestep,
+                    np.arange(1, timestep + 2),
+                )
+                state["target_timestep"] = 4
+                MS._write_checkpoint(directory, state)
+            results = MS.load_checkpoint(directory)
+
+            _, frames = MS._animation_frame_sources(
+                results, frame_stride=2
+            )
+
+        self.assertEqual([timestep for timestep, _ in frames], [1, 3, 4])
+
+    def test_animation_timestep_bounds_do_not_include_outside_frames(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            for timestep in range(1, 5):
+                state = self._checkpoint_state(
+                    np.full((2, 2), timestep, dtype=np.int64),
+                    timestep,
+                    np.arange(1, timestep + 2),
+                )
+                state["target_timestep"] = 4
+                MS._write_checkpoint(directory, state)
+            results = MS.load_checkpoint(directory)
+
+            _, frames = MS._animation_frame_sources(
+                results,
+                start_timestep=1.5,
+                end_timestep=3.5,
+            )
+
+        self.assertEqual([timestep for timestep, _ in frames], [2, 3])
+
+    def test_animation_max_frames_downsamples_and_keeps_endpoint(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            for timestep in range(1, 7):
+                state = self._checkpoint_state(
+                    np.full((2, 2), timestep, dtype=np.int64),
+                    timestep,
+                    np.arange(1, timestep + 2),
+                )
+                state["target_timestep"] = 6
+                MS._write_checkpoint(directory, state)
+            results = MS.load_checkpoint(directory)
+
+            _, frames = MS._animation_frame_sources(
+                results, max_frames=3
+            )
+
+        self.assertLessEqual(len(frames), 3)
+        self.assertEqual(frames[0][0], 1)
+        self.assertEqual(frames[-1][0], 6)
+
+    def test_specific_checkpoint_excludes_later_siblings(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            first, second = self._write_test_checkpoints(directory)
+
+            _, frames = MS._animation_frame_sources(second)
+            with self.assertRaisesRegex(ValueError, "at least two"):
+                MS._animation_frame_sources(first)
+
+        self.assertEqual([timestep for timestep, _ in frames], [1, 2])
+
+    def test_gif_save_uses_pillow_and_creates_animation_directory(self):
+        from matplotlib.animation import PillowWriter
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            self._write_test_checkpoints(directory)
+            destination = directory / "animations" / "run.gif"
+
+            with patch("matplotlib.animation.Animation.save") as save:
+                animation = MS.animate_lattice(
+                    directory,
+                    interval=200,
+                    save_path=destination,
+                    display=False,
+                )
+
+            self.assertTrue(destination.parent.is_dir())
+            save.assert_called_once()
+            self.assertEqual(save.call_args.args[0], str(destination))
+            self.assertIsInstance(
+                save.call_args.kwargs["writer"], PillowWriter
+            )
+            self.assertEqual(save.call_args.kwargs["writer"].fps, 5)
+            animation._draw_was_started = True
+
+    def test_animation_requires_checkpoint_history(self):
+        results = self._checkpoint_state(
+            np.ones((2, 2), dtype=np.int64), 2, [1, 1, 1]
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires checkpoints"):
+            MS.animate_lattice(results, display=False)
 
 
 if __name__ == "__main__":

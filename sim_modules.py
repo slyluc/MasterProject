@@ -1473,18 +1473,115 @@ def _load_patchiness_history(results, checkpoint_dir=None):
     return timesteps, patchiness
 
 
-def show_results(results, show_patchiness=False, checkpoint_dir=None):
-    """Plot the final lattice and diversity, optionally with patchiness.
+def _load_lattice_snapshot(results, lattice_timestep, checkpoint_dir=None):
+    """Load the available lattice nearest to a requested timestep."""
+    if isinstance(lattice_timestep, (bool, np.bool_)) or not isinstance(
+        lattice_timestep, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("lattice_timestep must be a real number")
+
+    requested_timestep = float(lattice_timestep)
+    if not np.isfinite(requested_timestep):
+        raise ValueError("lattice_timestep must be finite")
+    if requested_timestep < 0:
+        raise ValueError("lattice_timestep cannot be negative")
+
+    result_lattice = np.asarray(results["lattice"])
+    result_timestep = results.get("timestep")
+    if result_timestep is None:
+        result_timestep = np.asarray(results["tracked_timesteps"])[-1]
+    result_timestep = int(result_timestep)
+
+    # The in-memory result is the nearest eligible state at or beyond the
+    # completed result time, so no checkpoint metadata is needed there.
+    if requested_timestep >= result_timestep:
+        return result_lattice, result_timestep
+
+    try:
+        checkpoint_files = _patchiness_checkpoint_files(
+            results, checkpoint_dir=checkpoint_dir
+        )
+    except ValueError as error:
+        raise ValueError(
+            "selecting a historical lattice requires checkpoints; pass "
+            "checkpoint_dir or use a result/state with checkpoint metadata"
+        ) from error
+
+    # Checkpoint filenames are written from their integer simulation time.
+    # Inspecting these names avoids loading every (potentially large) lattice.
+    files_by_timestep = {
+        timestep: checkpoint_file
+        for checkpoint_file in checkpoint_files
+        if 0 <= (timestep := _checkpoint_timestep(checkpoint_file))
+        <= result_timestep
+        and timestep != result_timestep
+    }
+    available_timesteps = [result_timestep, *files_by_timestep]
+    selected_timestep = min(
+        available_timesteps,
+        key=lambda timestep: (
+            abs(timestep - requested_timestep),
+            timestep,
+        ),
+    )
+
+    # The in-memory result is also an available lattice and is preferred at
+    # its own timestep, even if a duplicate final checkpoint exists.
+    if selected_timestep == result_timestep:
+        return result_lattice, result_timestep
+
+    checkpoint_file = files_by_timestep[selected_timestep]
+    with np.load(checkpoint_file, allow_pickle=False) as saved:
+        missing = {"lattice", "timestep"}.difference(saved.files)
+        if missing:
+            raise ValueError(
+                f"checkpoint {checkpoint_file} is missing: "
+                f"{', '.join(sorted(missing))}"
+            )
+        saved_timestep = int(saved["timestep"])
+        if saved_timestep != selected_timestep:
+            raise ValueError(
+                f"checkpoint {checkpoint_file} contains timestep "
+                f"{saved_timestep}; expected {selected_timestep}"
+            )
+        lattice = saved["lattice"].copy()
+
+    if lattice.shape != result_lattice.shape:
+        raise ValueError(
+            f"checkpoint {checkpoint_file} has lattice shape "
+            f"{lattice.shape}; expected {result_lattice.shape}"
+        )
+    return lattice, selected_timestep
+
+
+def show_results(
+    results,
+    show_patchiness=False,
+    checkpoint_dir=None,
+    lattice_timestep=None,
+):
+    """Plot a lattice snapshot and the full diversity/patchiness history.
 
     When ``show_patchiness`` is true, patch counts are calculated from the
     available checkpoint lattices and drawn against a separate right-hand
     y-axis. ``checkpoint_dir`` can explicitly name a checkpoint directory or
-    file; otherwise checkpoint metadata in ``results`` is used.
+    file; otherwise checkpoint metadata in ``results`` is used. When
+    ``lattice_timestep`` is supplied, the lattice nearest to that simulation
+    time is loaded from the available checkpoints. The time-series plots are
+    still drawn through the full result time.
     """
     if not isinstance(show_patchiness, (bool, np.bool_)):
         raise TypeError("show_patchiness must be True or False")
 
     lattice = results["lattice"]
+    selected_timestep = None
+    if lattice_timestep is not None:
+        lattice, selected_timestep = _load_lattice_snapshot(
+            results,
+            lattice_timestep,
+            checkpoint_dir=checkpoint_dir,
+        )
+
     species_ids = np.unique(lattice[lattice > 0])
     number_of_species = species_ids.size
 
@@ -1513,7 +1610,13 @@ def show_results(results, show_patchiness=False, checkpoint_dir=None):
     ax_lattice.imshow(
         display_lattice, cmap=cmap, norm=norm, interpolation="nearest"
     )
-    ax_lattice.set_title(f"Final lattice: {number_of_species:,} living species")
+    if selected_timestep is None:
+        lattice_title = "Final lattice"
+    else:
+        lattice_title = f"Lattice at timestep {selected_timestep:,}"
+    ax_lattice.set_title(
+        f"{lattice_title}: {number_of_species:,} living species"
+    )
     ax_lattice.set_axis_off()
 
     diversity_line, = ax_diversity.plot(
@@ -1550,6 +1653,344 @@ def show_results(results, show_patchiness=False, checkpoint_dir=None):
     plt.show()
 
     initial_species = int(results["diversity_history"][0])
-    print(f"Living species:        {results['diversity']:,}")
-    print(f"Largest species ID:    {results['newest_species']:,}")
+    if selected_timestep is None:
+        print(f"Living species:        {results['diversity']:,}")
+        print(f"Largest species ID:    {results['newest_species']:,}")
+    else:
+        print(f"Displayed timestep:    {selected_timestep:,}")
+        print(f"Displayed species:     {number_of_species:,}")
+        print(f"Final living species:  {results['diversity']:,}")
+        print(f"Final largest ID:      {results['newest_species']:,}")
     print(f"Species introduced:    {results['newest_species'] - initial_species:,}")
+
+
+def _validate_animation_timestep(value, name):
+    """Return one optional finite, non-negative animation boundary."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(f"{name} must be a real number or None")
+    value = float(value)
+    if not np.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if value < 0:
+        raise ValueError(f"{name} cannot be negative")
+    return value
+
+
+def _animation_frame_sources(
+    source,
+    checkpoint_dir=None,
+    start_timestep=None,
+    end_timestep=None,
+    frame_stride=1,
+    max_frames=150,
+):
+    """Return a result and its selected, ordered animation frame sources."""
+    if isinstance(source, (str, os.PathLike)):
+        results = load_checkpoint(source)
+    elif isinstance(source, Mapping):
+        results = source
+    else:
+        raise TypeError(
+            "source must be a result/state mapping or checkpoint path"
+        )
+
+    if isinstance(frame_stride, (bool, np.bool_)) or not isinstance(
+        frame_stride, (int, np.integer)
+    ):
+        raise TypeError("frame_stride must be an integer")
+    frame_stride = int(frame_stride)
+    if frame_stride < 1:
+        raise ValueError("frame_stride must be at least 1")
+    if max_frames is not None:
+        if isinstance(max_frames, (bool, np.bool_)) or not isinstance(
+            max_frames, (int, np.integer)
+        ):
+            raise TypeError("max_frames must be an integer or None")
+        max_frames = int(max_frames)
+        if max_frames < 2:
+            raise ValueError("max_frames must be at least 2 or None")
+
+    start_timestep = _validate_animation_timestep(
+        start_timestep, "start_timestep"
+    )
+    end_timestep = _validate_animation_timestep(
+        end_timestep, "end_timestep"
+    )
+    if (
+        start_timestep is not None
+        and end_timestep is not None
+        and start_timestep > end_timestep
+    ):
+        raise ValueError("start_timestep cannot exceed end_timestep")
+
+    result_lattice = np.asarray(results["lattice"])
+    if result_lattice.ndim != 2:
+        raise ValueError("result lattice must be two-dimensional")
+    result_timestep = results.get("timestep")
+    if result_timestep is None:
+        result_timestep = np.asarray(results["tracked_timesteps"])[-1]
+    result_timestep = int(result_timestep)
+
+    try:
+        checkpoint_files = _patchiness_checkpoint_files(
+            results, checkpoint_dir=checkpoint_dir
+        )
+    except ValueError as error:
+        raise ValueError(
+            "animating lattice evolution requires checkpoints; pass "
+            "checkpoint_dir, a checkpoint path, or a result/state with "
+            "checkpoint metadata"
+        ) from error
+
+    files_by_timestep = {}
+    for checkpoint_file in checkpoint_files:
+        timestep = _checkpoint_timestep(checkpoint_file)
+        if 0 <= timestep < result_timestep:
+            files_by_timestep[timestep] = checkpoint_file
+
+    # Prefer the supplied in-memory endpoint over a duplicate final file.
+    frames = sorted(files_by_timestep.items())
+    frames.append((result_timestep, None))
+    available_timesteps = [timestep for timestep, _ in frames]
+    if start_timestep is None:
+        start_index = 0
+    else:
+        start_index = next(
+            (
+                index
+                for index, timestep in enumerate(available_timesteps)
+                if timestep >= start_timestep
+            ),
+            len(frames),
+        )
+    if end_timestep is None:
+        end_index = len(frames) - 1
+    else:
+        end_index = next(
+            (
+                index
+                for index in range(len(frames) - 1, -1, -1)
+                if available_timesteps[index] <= end_timestep
+            ),
+            -1,
+        )
+    selected_frames = frames[start_index:end_index + 1]
+    if not selected_frames:
+        raise ValueError("the requested timestep range contains no snapshots")
+
+    endpoint = selected_frames[-1]
+    selected_frames = selected_frames[::frame_stride]
+    if selected_frames[-1][0] != endpoint[0]:
+        selected_frames.append(endpoint)
+    if max_frames is not None and len(selected_frames) > max_frames:
+        selected_indices = np.linspace(
+            0,
+            len(selected_frames) - 1,
+            num=max_frames,
+            dtype=np.int64,
+        )
+        selected_frames = [
+            selected_frames[int(index)] for index in selected_indices
+        ]
+    if len(selected_frames) < 2:
+        raise ValueError(
+            "an animation requires at least two checkpoint states in the "
+            "selected timestep range"
+        )
+    return results, selected_frames
+
+
+def _load_animation_lattice(results, frame, expected_shape):
+    """Load and validate one lazy animation frame."""
+    expected_timestep, checkpoint_file = frame
+    if checkpoint_file is None:
+        lattice = np.asarray(results["lattice"])
+        saved_timestep = expected_timestep
+    else:
+        with np.load(checkpoint_file, allow_pickle=False) as saved:
+            missing = {"lattice", "timestep"}.difference(saved.files)
+            if missing:
+                raise ValueError(
+                    f"checkpoint {checkpoint_file} is missing: "
+                    f"{', '.join(sorted(missing))}"
+                )
+            saved_timestep = int(saved["timestep"])
+            lattice = saved["lattice"].copy()
+
+    if saved_timestep != expected_timestep:
+        raise ValueError(
+            f"checkpoint {checkpoint_file} contains timestep "
+            f"{saved_timestep}; expected {expected_timestep}"
+        )
+    if lattice.shape != expected_shape:
+        raise ValueError(
+            f"checkpoint {checkpoint_file} has lattice shape "
+            f"{lattice.shape}; expected {expected_shape}"
+        )
+    return lattice
+
+
+def _lattice_rgba(lattice):
+    """Map a lattice to stable colors based on permanent species IDs."""
+    lattice = np.asarray(lattice)
+    rgba = np.empty(lattice.shape + (4,), dtype=np.float64)
+    rgba[...] = (0.92, 0.92, 0.92, 1.0)  # Empty sites.
+    rgba[lattice < 0] = (0.0, 0.0, 0.0, 1.0)  # Blocked sites.
+
+    occupied = lattice > 0
+    if np.any(occupied):
+        species_ids = lattice[occupied].astype(np.float64, copy=False)
+        hues = np.remainder(species_ids * 0.61803398875, 1.0)
+        rgba[occupied] = plt.colormaps["hsv"](hues)
+    return rgba
+
+
+def animate_lattice(
+    source,
+    checkpoint_dir=None,
+    *,
+    start_timestep=None,
+    end_timestep=None,
+    frame_stride=1,
+    max_frames=150,
+    interval=150,
+    repeat=True,
+    save_path=None,
+    display=True,
+    dpi=100,
+):
+    """Animate lattice evolution from a result or checkpoint sequence.
+
+    ``source`` may be a simulation result/state, a checkpoint directory, or
+    one checkpoint file. A specific checkpoint animates its sibling snapshots
+    only through that checkpoint's timestep. Start/end bounds are inclusive.
+    ``frame_stride`` keeps every nth available snapshot while always retaining
+    the selected endpoint. ``max_frames`` automatically downsamples long runs
+    to help keep notebook playback compact; set it to ``None`` to use every
+    selected frame.
+
+    In a notebook, ``display=True`` renders JavaScript playback controls.
+    Supplying ``save_path`` additionally writes a GIF (Pillow) or MP4 (FFmpeg).
+    The returned Matplotlib ``FuncAnimation`` can be reused or saved again.
+    """
+    if isinstance(interval, (bool, np.bool_)) or not isinstance(
+        interval, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("interval must be a real number")
+    interval = float(interval)
+    if not np.isfinite(interval) or interval <= 0:
+        raise ValueError("interval must be finite and positive")
+    if not isinstance(repeat, (bool, np.bool_)):
+        raise TypeError("repeat must be True or False")
+    if not isinstance(display, (bool, np.bool_)):
+        raise TypeError("display must be True or False")
+    if isinstance(dpi, (bool, np.bool_)) or not isinstance(
+        dpi, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("dpi must be a real number")
+    dpi = float(dpi)
+    if not np.isfinite(dpi) or dpi <= 0:
+        raise ValueError("dpi must be finite and positive")
+
+    results, frames = _animation_frame_sources(
+        source,
+        checkpoint_dir=checkpoint_dir,
+        start_timestep=start_timestep,
+        end_timestep=end_timestep,
+        frame_stride=frame_stride,
+        max_frames=max_frames,
+    )
+    expected_shape = np.asarray(results["lattice"]).shape
+    first_lattice = _load_animation_lattice(
+        results, frames[0], expected_shape
+    )
+
+    from matplotlib.animation import FuncAnimation
+
+    figure, axis = plt.subplots(figsize=(6, 6))
+    image = axis.imshow(
+        _lattice_rgba(first_lattice), interpolation="nearest"
+    )
+    title = axis.set_title("")
+    axis.set_axis_off()
+
+    first_frame_cache = {0: first_lattice}
+
+    def draw_frame(frame_index):
+        lattice = first_frame_cache.get(frame_index)
+        if lattice is None:
+            lattice = _load_animation_lattice(
+                results, frames[frame_index], expected_shape
+            )
+        timestep = frames[frame_index][0]
+        number_of_species = np.unique(lattice[lattice > 0]).size
+        image.set_data(_lattice_rgba(lattice))
+        title.set_text(
+            f"Lattice at timestep {timestep:,}: "
+            f"{number_of_species:,} living species"
+        )
+        return image, title
+
+    def initialize():
+        return draw_frame(0)
+
+    animation = FuncAnimation(
+        figure,
+        draw_frame,
+        frames=range(len(frames)),
+        init_func=initialize,
+        interval=interval,
+        repeat=bool(repeat),
+        blit=True,
+        cache_frame_data=False,
+    )
+    plt.tight_layout()
+
+    if save_path is not None:
+        if not isinstance(save_path, (str, os.PathLike)):
+            raise TypeError("save_path must be a path or None")
+        destination = Path(save_path).expanduser()
+        suffix = destination.suffix.lower()
+        if suffix not in {".gif", ".mp4"}:
+            raise ValueError("save_path must end in .gif or .mp4")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        frames_per_second = 1000.0 / interval
+
+        if suffix == ".gif":
+            from matplotlib.animation import PillowWriter
+
+            writer = PillowWriter(fps=frames_per_second)
+        else:
+            from matplotlib.animation import FFMpegWriter
+
+            if not FFMpegWriter.isAvailable():
+                raise RuntimeError(
+                    "saving MP4 animations requires FFmpeg; save as GIF "
+                    "or install FFmpeg"
+                )
+            writer = FFMpegWriter(fps=frames_per_second)
+        animation.save(str(destination), writer=writer, dpi=dpi)
+
+    if display:
+        try:
+            from IPython import get_ipython
+            from IPython.display import HTML, display as notebook_display
+        except ImportError:
+            plt.show()
+        else:
+            if get_ipython() is None:
+                plt.show()
+            else:
+                playback_mode = "loop" if repeat else "once"
+                notebook_display(
+                    HTML(animation.to_jshtml(default_mode=playback_mode))
+                )
+                plt.close(figure)
+    else:
+        plt.close(figure)
+
+    return animation

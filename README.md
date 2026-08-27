@@ -133,3 +133,65 @@ MS.show_results(
     checkpoint_dir="checkpoints/base_run",
 )
 ```
+
+To display the lattice nearest to a particular simulation timestep, pass
+`lattice_timestep`. The diversity and optional patchiness curves still cover
+the complete result period:
+
+```python
+MS.show_results(
+    results,
+    show_patchiness=True,
+    lattice_timestep=0.3e7,
+)
+```
+
+Historical lattices come from the saved checkpoints, so the displayed time is
+the closest available checkpoint time. The plot title reports the time that
+was actually selected. If checkpoint metadata is unavailable, use the same
+`checkpoint_dir` argument shown above.
+
+## Animate lattice evolution
+
+Animate a result directly in a notebook. Frames are loaded lazily,
+`frame_stride=10` uses every tenth checkpoint, and the endpoint is always
+included:
+
+```python
+animation = MS.animate_lattice(
+    results,
+    frame_stride=10,
+    interval=150,  # Milliseconds between frames
+)
+```
+
+A checkpoint directory or individual checkpoint file can be passed instead.
+An individual file animates the sibling snapshots only through that file's
+timestep. Start/end bounds are inclusive, using the first checkpoint at or
+after the start and the last checkpoint at or before the end:
+
+```python
+animation = MS.animate_lattice(
+    "checkpoints/base_run",
+    start_timestep=1e6,
+    end_timestep=5e6,
+    frame_stride=5,
+)
+```
+
+Save an ignored GIF under `animations/` by adding `save_path`. MP4 output is
+also supported when FFmpeg is installed:
+
+```python
+animation = MS.animate_lattice(
+    results,
+    frame_stride=10,
+    save_path="animations/base_run.gif",
+)
+```
+
+Blocked sites remain black, empty sites remain light gray, and each permanent
+species ID keeps the same color across the full animation. Long runs are
+automatically limited to 150 evenly spaced frames to help keep notebook
+playback compact; set `max_frames=None` to retain every selected checkpoint.
+Set `display=False` when saving without inline notebook playback.
