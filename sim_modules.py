@@ -49,6 +49,10 @@ class SimulationConfig:
     populate_first_100: bool = False
     # When set, save an atomic state file after every ``track_every`` interval.
     checkpoint_dir: str | None = None
+    # How many of those state files survive. None uses the default policy:
+    # the newest state, plus one window either side of each detected swap in
+    # living species. Pass RetentionPolicy(keep_all=True) to keep every one.
+    retention: "RetentionPolicy | None" = None
 
     def run_main(self, initial_state=None):
         """Run the ordinary simulation using the current settings."""
@@ -65,6 +69,7 @@ class SimulationConfig:
             populate_first_100=self.populate_first_100,
             initial_state=initial_state,
             checkpoint_dir=self.checkpoint_dir,
+            retention=self.retention,
         )
 
     def run_percolation(self, initial_state=None):
@@ -83,6 +88,7 @@ class SimulationConfig:
             populate_first_100=self.populate_first_100,
             initial_state=initial_state,
             checkpoint_dir=self.checkpoint_dir,
+            retention=self.retention,
         )
 
     def resume(self, checkpoint=None):
@@ -114,6 +120,7 @@ class SimulationConfig:
             progress=self.progress,
             populate_first_100=self.populate_first_100,
             checkpoint_dir=output_dir,
+            retention=self.retention,
             target_timestep=target,
         )
 
@@ -193,6 +200,25 @@ def load_checkpoint(path):
             "populate_first_100": bool(saved["populate_first_100"]),
             "checkpoint_path": str(checkpoint_path.resolve()),
         }
+
+    # The patch series lives in the run's analysis record rather than in the
+    # snapshot, because most snapshots are deleted once they are counted. A
+    # snapshot from the middle of a run only carries the history up to its own
+    # time, so the record is trimmed to match before it is attached.
+    tracked_count = state["tracked_timesteps"].size
+    patch_history = np.full(tracked_count, _MISSING_PATCH_COUNT, dtype=np.int64)
+    analysis = load_analysis(checkpoint_path)
+    if analysis is not None:
+        recorded_times = np.asarray(analysis["tracked_timesteps"])
+        if recorded_times.size >= tracked_count and np.array_equal(
+            recorded_times[:tracked_count], state["tracked_timesteps"]
+        ):
+            patch_history = np.asarray(
+                analysis["patch_history"], dtype=np.int64
+            )[:tracked_count].copy()
+            state["analysis_path"] = analysis["analysis_path"]
+            state["event_timesteps"] = analysis["event_timesteps"].copy()
+    state["patch_history"] = patch_history
     return state
 
 
@@ -300,6 +326,21 @@ def _normalize_initial_state(initial_state):
         tracked_timesteps = tracked_timesteps.copy()
         diversity_history = diversity_history.copy()
 
+    supplied_patches = initial_state.get("patch_history")
+    if supplied_patches is None:
+        patch_history = np.full(
+            tracked_timesteps.size, _MISSING_PATCH_COUNT, dtype=np.int64
+        )
+    else:
+        patch_history = np.asarray(supplied_patches, dtype=np.int64)
+        if patch_history.ndim != 1:
+            raise ValueError("patch_history must be one-dimensional")
+        if patch_history.size != tracked_timesteps.size:
+            raise ValueError(
+                "patch_history must have one entry per tracked timestep"
+            )
+        patch_history = patch_history.copy()
+
     rng_state = initial_state.get("rng_state")
     if isinstance(rng_state, str):
         rng_state = json.loads(rng_state)
@@ -315,6 +356,7 @@ def _normalize_initial_state(initial_state):
         "target_timestep": initial_state.get("target_timestep"),
         "tracked_timesteps": tracked_timesteps,
         "diversity_history": diversity_history,
+        "patch_history": patch_history,
         "rng_state": dict(rng_state) if rng_state is not None else None,
     }
 
@@ -394,6 +436,349 @@ def _validate_checkpoint_destination(checkpoint_dir, initial_timestep):
             f"{directory} already contains later checkpoints; "
             "use a new checkpoint_dir for a fresh run or changed-rule branch"
         )
+
+
+_ANALYSIS_FILENAME = "analysis.npz"
+_ANALYSIS_VERSION = 1
+# Stored in a patch history where the lattice behind a sample is already gone.
+_MISSING_PATCH_COUNT = -1
+
+
+@dataclass
+class RetentionPolicy:
+    """Rules deciding which lattice snapshots a run keeps on disk.
+
+    A long run writes one full lattice every tracking interval, which is
+    gigabytes of nearly redundant state. Only three things are ever read
+    back: the newest state, so the run can be resumed or plotted; the
+    diversity and patch series, which the analysis record holds; and the
+    lattices surrounding a large swap in living species, which are the
+    interesting part of the history. Everything else is deleted as the run
+    produces it.
+
+    ``event_window`` is kept on *each* side of a detected swap. Snapshots
+    newer than one window are always held, because a swap detected later
+    still needs its run-up. Set ``keep_all`` to restore the old behaviour of
+    keeping every snapshot.
+    """
+
+    keep_all: bool = False
+    # Simulation time kept on each side of a detected swap.
+    event_window: int = 1_000_000
+    # Width of the moving average applied before thresholding, in samples.
+    smooth_samples: int = 5
+    # Quantile of the diversity series taken as the high-regime level that
+    # the two thresholds are fractions of. A median would sink along with a
+    # long collapse, dragging both thresholds under the series and hiding the
+    # recovery until its snapshots were already deleted.
+    reference_quantile: float = 0.75
+    # Regime thresholds, as fractions of that high-regime level.
+    low_fraction: float = 0.25
+    high_fraction: float = 0.60
+    # Report nothing when the two thresholds are too close to separate real
+    # regimes, which is the case for a run whose diversity barely moves.
+    minimum_swing: float = 2.0
+    # Re-run detection after this many new snapshots.
+    detect_every: int = 10
+
+
+def _moving_average(values, window):
+    """Smooth a series with an edge-padded uniform window of odd width."""
+    values = np.asarray(values, dtype=np.float64)
+    window = max(1, int(window)) | 1
+    if window == 1 or values.size < 2:
+        return values.astype(np.float64, copy=True)
+    half = window // 2
+    padded = np.pad(values, half, mode="edge")
+    kernel = np.full(window, 1.0 / window)
+    return np.convolve(padded, kernel, mode="valid")[: values.size]
+
+
+def detect_diversity_swaps(
+    timesteps, diversity_history, policy=None, reference=None
+):
+    """Return the timesteps at which living species swap between regimes.
+
+    The series is smoothed, then walked with two thresholds taken from its
+    high-regime level: a swap is recorded when the smoothed curve falls to
+    the low threshold while in the high regime, or rises to the high
+    threshold while in the low regime. Using two thresholds rather than one
+    stops a curve lingering near a single level from reporting the same
+    transition over and over.
+
+    ``reference`` overrides the high-regime level. A live run passes the
+    largest level it has seen so far, so that thresholds established early do
+    not drift downwards during a long collapse.
+    """
+    timesteps = np.asarray(timesteps, dtype=np.int64)
+    diversity_history = np.asarray(diversity_history, dtype=np.float64)
+    if timesteps.shape != diversity_history.shape:
+        raise ValueError(
+            "timesteps and diversity_history must have equal length"
+        )
+    if policy is None:
+        policy = RetentionPolicy()
+    if timesteps.size < 3:
+        return np.empty(0, dtype=np.int64)
+
+    smoothed = _moving_average(diversity_history, policy.smooth_samples)
+    if reference is None:
+        reference = regime_reference(diversity_history, policy)
+    low_level = float(policy.low_fraction) * float(reference)
+    high_level = float(policy.high_fraction) * float(reference)
+    if high_level - low_level < float(policy.minimum_swing):
+        return np.empty(0, dtype=np.int64)
+
+    in_high_regime = bool(smoothed[0] > 0.5 * (low_level + high_level))
+    events = []
+    for index in range(smoothed.size):
+        value = smoothed[index]
+        if in_high_regime and value <= low_level:
+            in_high_regime = False
+            events.append(int(timesteps[index]))
+        elif not in_high_regime and value >= high_level:
+            in_high_regime = True
+            events.append(int(timesteps[index]))
+    return np.asarray(events, dtype=np.int64)
+
+
+def _diversity_quantile(diversity_history, policy):
+    """Take the policy's quantile of one diversity series."""
+    diversity_history = np.asarray(diversity_history, dtype=np.float64)
+    if not diversity_history.size:
+        return 0.0
+    return float(
+        np.quantile(diversity_history, float(policy.reference_quantile))
+    )
+
+
+def regime_reference(diversity_history, policy=None):
+    """Estimate the living-species level of a run's high regime.
+
+    The estimate is the largest quantile reached over the run's growing
+    prefixes rather than the quantile of the finished series. A collapse
+    lasting most of a run would otherwise pull the plain quantile down into
+    the low regime, putting both thresholds under the series and hiding the
+    very swap that caused the collapse. Walking prefixes instead fixes the
+    level once the run has shown a high regime, and matches what a live run
+    computes as it goes.
+    """
+    if policy is None:
+        policy = RetentionPolicy()
+    diversity_history = np.asarray(diversity_history, dtype=np.float64)
+    if not diversity_history.size:
+        return 0.0
+    step = max(1, int(policy.detect_every))
+    ends = list(range(step, diversity_history.size, step))
+    ends.append(diversity_history.size)
+    return max(
+        _diversity_quantile(diversity_history[:end], policy) for end in ends
+    )
+
+
+def _write_analysis(checkpoint_dir, record):
+    """Atomically replace a run's analysis record and return its path."""
+    directory = Path(checkpoint_dir).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / _ANALYSIS_FILENAME
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".analysis_", suffix=".tmp.npz", dir=directory
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        with temporary_path.open("wb") as temporary_file:
+            np.savez(
+                temporary_file,
+                format_version=np.int64(_ANALYSIS_VERSION),
+                tracked_timesteps=np.asarray(
+                    record["tracked_timesteps"], dtype=np.int64
+                ),
+                diversity_history=np.asarray(
+                    record["diversity_history"], dtype=np.int64
+                ),
+                patch_history=np.asarray(
+                    record["patch_history"], dtype=np.int64
+                ),
+                event_timesteps=np.asarray(
+                    record["event_timesteps"], dtype=np.int64
+                ),
+                timestep=np.int64(record["timestep"]),
+                target_timestep=np.int64(record["target_timestep"]),
+                gamma=np.float64(record["gamma"]),
+                alpha=np.float64(record["alpha"]),
+                track_every=np.int64(record["track_every"]),
+                populate_first_100=np.bool_(record["populate_first_100"]),
+                lattice_shape=np.asarray(
+                    record["lattice_shape"], dtype=np.int64
+                ),
+            )
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return str(destination.resolve())
+
+
+def load_analysis(path):
+    """Load a run's analysis record, or ``None`` when the run has none.
+
+    ``path`` may be the run's checkpoint directory, a checkpoint file inside
+    it, or the analysis file itself. The record holds the full living-species
+    and patch series for the run, so plots no longer need the lattices that
+    produced them. A sample whose lattice was never counted stores -1 as its
+    patch count.
+    """
+    analysis_path = Path(path).expanduser()
+    if analysis_path.is_dir():
+        analysis_path = analysis_path / _ANALYSIS_FILENAME
+    elif analysis_path.name != _ANALYSIS_FILENAME:
+        analysis_path = analysis_path.parent / _ANALYSIS_FILENAME
+    if not analysis_path.is_file():
+        return None
+
+    with np.load(analysis_path, allow_pickle=False) as saved:
+        version = int(saved["format_version"])
+        if version != _ANALYSIS_VERSION:
+            raise ValueError(
+                f"unsupported analysis version {version}; "
+                f"expected {_ANALYSIS_VERSION}"
+            )
+        record = {name: saved[name].copy() for name in saved.files}
+
+    record["timestep"] = int(record["timestep"])
+    record["target_timestep"] = int(record["target_timestep"])
+    record["track_every"] = int(record["track_every"])
+    record["gamma"] = float(record["gamma"])
+    record["alpha"] = float(record["alpha"])
+    record["populate_first_100"] = bool(record["populate_first_100"])
+    record["analysis_path"] = str(analysis_path.resolve())
+    return record
+
+
+class _CheckpointRetention:
+    """Delete the snapshots a run no longer needs, while it produces them.
+
+    A snapshot survives when it is newer than one ``event_window`` (a swap
+    detected later would need it as run-up), or when it sits inside the
+    window around a detected swap. The newest snapshot therefore always
+    survives, which is what keeps a pruned run resumable.
+
+    A snapshot only becomes a deletion candidate once its patch count is in
+    the analysis record. That makes the policy safe to point at a directory
+    written before analysis records existed: nothing there is counted yet, so
+    nothing there is deleted.
+    """
+
+    def __init__(self, checkpoint_dir, policy):
+        self.directory = Path(checkpoint_dir).expanduser()
+        self.policy = policy
+        self.events = np.empty(0, dtype=np.int64)
+        self.reference = 0.0
+        self._pending = []
+        # None forces a detection pass on the first recorded snapshot, so
+        # adopted files are judged against real events, not an empty list.
+        self._since_detection = None
+
+    def adopt_existing(self):
+        """Take responsibility for snapshots an earlier leg left behind."""
+        if self.policy.keep_all or not self.directory.is_dir():
+            return
+        for path in self.directory.glob("checkpoint_*.npz"):
+            timestep = _checkpoint_timestep(path)
+            if timestep >= 0:
+                self._pending.append((timestep, path))
+        self._pending.sort()
+
+    def record(self, path, timestep, timesteps, diversity, patches):
+        """Register a new snapshot and drop whatever is now redundant."""
+        if self.policy.keep_all:
+            return []
+        self._pending.append((int(timestep), Path(path)))
+        interval = max(1, int(self.policy.detect_every))
+        if self._since_detection is None or self._since_detection >= interval:
+            self._since_detection = 0
+            self._refresh_events(timesteps, diversity)
+        else:
+            self._since_detection += 1
+        return self._prune(timesteps, patches)
+
+    def finish(self, timesteps, diversity, patches):
+        """Run a final detection and pruning pass once the leg has stopped."""
+        if self.policy.keep_all:
+            return []
+        self._refresh_events(timesteps, diversity)
+        return self._prune(timesteps, patches)
+
+    def _refresh_events(self, timesteps, diversity):
+        # The reference only ever rises. A run that has already shown a high
+        # regime keeps judging against it, so a recovery out of a long
+        # collapse is recognised while its snapshots are still on disk.
+        self.reference = max(
+            self.reference, _diversity_quantile(diversity, self.policy)
+        )
+        detected = detect_diversity_swaps(
+            timesteps, diversity, self.policy, reference=self.reference
+        )
+        # Windows already granted are never revoked. A snapshot deleted on an
+        # earlier estimate cannot be brought back, so keeping the union makes
+        # the surviving set stable while the median is still settling.
+        self.events = np.union1d(self.events, detected)
+
+    def _survives(self, timestep, newest_timestep):
+        window = int(self.policy.event_window)
+        if timestep >= newest_timestep - window:
+            return True
+        if not self.events.size:
+            return False
+        return bool(np.any(np.abs(self.events - timestep) <= window))
+
+    def _prune(self, timesteps, patches):
+        timesteps = np.asarray(timesteps, dtype=np.int64)
+        patches = np.asarray(patches, dtype=np.int64)
+        if not timesteps.size:
+            return []
+        newest_timestep = int(timesteps[-1])
+
+        removed = []
+        survivors = []
+        for timestep, path in self._pending:
+            index = int(np.searchsorted(timesteps, timestep))
+            counted = (
+                index < timesteps.size
+                and int(timesteps[index]) == timestep
+                and int(patches[index]) >= 0
+            )
+            if not counted or self._survives(timestep, newest_timestep):
+                survivors.append((timestep, path))
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            removed.append(str(path))
+        self._pending = survivors
+        return removed
+
+
+def _align_patch_history(patch_history, sample_count):
+    """Pad or trim a patch series to exactly one entry per tracked sample."""
+    patch_history = np.asarray(patch_history, dtype=np.int64)
+    if patch_history.size == sample_count:
+        return patch_history
+    if patch_history.size > sample_count:
+        return patch_history[:sample_count].copy()
+    return np.concatenate(
+        [
+            patch_history,
+            np.full(
+                sample_count - patch_history.size,
+                _MISSING_PATCH_COUNT,
+                dtype=np.int64,
+            ),
+        ]
+    )
 
 
 def create_lattice(L_col, L_row, D, rng=None):
@@ -829,7 +1214,9 @@ def _simulate_lattice(
     initial_timestep=0,
     prior_tracked_timesteps=None,
     prior_diversity_history=None,
+    prior_patch_history=None,
     checkpoint_dir=None,
+    retention=None,
     target_timestep=None,
 ):
     """Prepare state and run the exact sequential model in compiled code."""
@@ -934,6 +1321,26 @@ def _simulate_lattice(
             prior_diversity_history, dtype=np.int64
         ).copy()
 
+    if prior_patch_history is None:
+        prior_patch_history = np.full(
+            prior_tracked_timesteps.size, _MISSING_PATCH_COUNT, dtype=np.int64
+        )
+    else:
+        prior_patch_history = _align_patch_history(
+            prior_patch_history, prior_tracked_timesteps.size
+        )
+    if checkpoint_dir is not None and prior_patch_history.size:
+        # The starting lattice is in hand, so its patch count costs nothing
+        # here and makes the sample the leg resumes from safe to delete.
+        prior_patch_history[-1] = count_patches(lattice)
+
+    if retention is None:
+        retention = RetentionPolicy()
+    snapshot_retention = None
+    if checkpoint_dir is not None:
+        snapshot_retention = _CheckpointRetention(checkpoint_dir, retention)
+        snapshot_retention.adopt_existing()
+
     progress_bar = None
     if progress:
         try:
@@ -960,7 +1367,9 @@ def _simulate_lattice(
 
     diversity_chunks = []
     timestep_chunks = []
+    patch_counts = []
     checkpoint_files = []
+    removed_files = set()
 
     if not progress and checkpoint_dir is None:
         if T:
@@ -1030,17 +1439,21 @@ def _simulate_lattice(
                     exported = _export_simulation_state(
                         state, rows, columns
                     )
+                    tracked_so_far = np.concatenate(
+                        [prior_tracked_timesteps, *timestep_chunks]
+                    )
+                    diversity_so_far = np.concatenate(
+                        [prior_diversity_history, *diversity_chunks]
+                    )
+                    snapshot_timestep = (
+                        int(initial_timestep) + previous_timestep
+                    )
                     exported.update(
                         {
-                            "timestep": int(initial_timestep)
-                            + previous_timestep,
+                            "timestep": snapshot_timestep,
                             "target_timestep": target_timestep,
-                            "tracked_timesteps": np.concatenate(
-                                [prior_tracked_timesteps, *timestep_chunks]
-                            ),
-                            "diversity_history": np.concatenate(
-                                [prior_diversity_history, *diversity_chunks]
-                            ),
+                            "tracked_timesteps": tracked_so_far,
+                            "diversity_history": diversity_so_far,
                             "rng_state": rng.bit_generator.state,
                             "gamma": float(gamma),
                             "alpha": float(alpha),
@@ -1048,8 +1461,46 @@ def _simulate_lattice(
                             "populate_first_100": bool(populate_first_100),
                         }
                     )
-                    checkpoint_files.append(
-                        _write_checkpoint(checkpoint_dir, exported)
+                    written_file = _write_checkpoint(checkpoint_dir, exported)
+                    checkpoint_files.append(written_file)
+
+                    # Patches are counted here, while the lattice is in
+                    # memory, because retention deletes most snapshots and
+                    # the count could not be recovered afterwards.
+                    patch_counts.append(count_patches(exported["lattice"]))
+                    patch_so_far = _align_patch_history(
+                        np.concatenate(
+                            [
+                                prior_patch_history,
+                                np.asarray(patch_counts, dtype=np.int64),
+                            ]
+                        ),
+                        tracked_so_far.size,
+                    )
+                    removed_files.update(
+                        snapshot_retention.record(
+                            written_file,
+                            snapshot_timestep,
+                            tracked_so_far,
+                            diversity_so_far,
+                            patch_so_far,
+                        )
+                    )
+                    _write_analysis(
+                        checkpoint_dir,
+                        {
+                            "tracked_timesteps": tracked_so_far,
+                            "diversity_history": diversity_so_far,
+                            "patch_history": patch_so_far,
+                            "event_timesteps": snapshot_retention.events,
+                            "timestep": snapshot_timestep,
+                            "target_timestep": target_timestep,
+                            "gamma": float(gamma),
+                            "alpha": float(alpha),
+                            "track_every": int(track_every),
+                            "populate_first_100": bool(populate_first_100),
+                            "lattice_shape": (rows, columns),
+                        },
                     )
         finally:
             if progress_bar is not None:
@@ -1061,6 +1512,46 @@ def _simulate_lattice(
     diversity_history = np.concatenate(
         [prior_diversity_history, *diversity_chunks]
     )
+    # A leg that never wrote snapshots leaves its new samples uncounted, so
+    # the series is padded rather than assumed complete.
+    patch_history = _align_patch_history(
+        np.concatenate(
+            [prior_patch_history, np.asarray(patch_counts, dtype=np.int64)]
+        ),
+        tracked_timesteps.size,
+    )
+
+    analysis_path = None
+    event_timesteps = np.empty(0, dtype=np.int64)
+    if snapshot_retention is not None:
+        # The last detection pass sees the whole leg, so a swap that was
+        # still inside the rolling window at the final snapshot is caught.
+        removed_files.update(
+            snapshot_retention.finish(
+                tracked_timesteps, diversity_history, patch_history
+            )
+        )
+        event_timesteps = snapshot_retention.events
+        analysis_path = _write_analysis(
+            checkpoint_dir,
+            {
+                "tracked_timesteps": tracked_timesteps,
+                "diversity_history": diversity_history,
+                "patch_history": patch_history,
+                "event_timesteps": event_timesteps,
+                "timestep": target_timestep,
+                "target_timestep": target_timestep,
+                "gamma": float(gamma),
+                "alpha": float(alpha),
+                "track_every": int(track_every),
+                "populate_first_100": bool(populate_first_100),
+                "lattice_shape": (rows, columns),
+            },
+        )
+        checkpoint_files = [
+            path for path in checkpoint_files if path not in removed_files
+        ]
+
     final_result = _export_simulation_state(state, rows, columns)
     final_result.update(
         {
@@ -1079,8 +1570,12 @@ def _simulate_lattice(
             "target_timestep": target_timestep,
             "tracked_timesteps": tracked_timesteps,
             "diversity_history": diversity_history,
+            "patch_history": patch_history,
+            "event_timesteps": event_timesteps,
             "rng_state": rng.bit_generator.state,
             "checkpoint_files": checkpoint_files,
+            "removed_checkpoint_files": sorted(removed_files),
+            "analysis_path": analysis_path,
         }
     )
     return final_result
@@ -1096,6 +1591,7 @@ def simulation_from_state(
     progress=False,
     populate_first_100=False,
     checkpoint_dir=None,
+    retention=None,
     target_timestep=None,
 ):
     """Run ``T`` additional time units from a result or saved checkpoint.
@@ -1129,7 +1625,9 @@ def simulation_from_state(
         initial_timestep=state["timestep"],
         prior_tracked_timesteps=state["tracked_timesteps"],
         prior_diversity_history=state["diversity_history"],
+        prior_patch_history=state["patch_history"],
         checkpoint_dir=checkpoint_dir,
+        retention=retention,
         target_timestep=target_timestep,
     )
 
@@ -1147,6 +1645,7 @@ def main_simulation(
     populate_first_100=False,
     initial_state=None,
     checkpoint_dir=None,
+    retention=None,
 ):
     """Run the spatial invasion simulation.
 
@@ -1183,6 +1682,7 @@ def main_simulation(
             progress=progress,
             populate_first_100=populate_first_100,
             checkpoint_dir=checkpoint_dir,
+            retention=retention,
         )
 
     rng = _make_rng(seed)
@@ -1201,6 +1701,7 @@ def main_simulation(
         progress,
         populate_first_100,
         checkpoint_dir=checkpoint_dir,
+        retention=retention,
     )
 
 
@@ -1218,6 +1719,7 @@ def percolation_simulation(
     populate_first_100=False,
     initial_state=None,
     checkpoint_dir=None,
+    retention=None,
 ):
     """Run the simulation with permanent random site removal.
 
@@ -1252,6 +1754,7 @@ def percolation_simulation(
             progress=progress,
             populate_first_100=populate_first_100,
             checkpoint_dir=checkpoint_dir,
+            retention=retention,
         )
         result["p"] = float(p)
         result["p_applied"] = False
@@ -1308,6 +1811,7 @@ def percolation_simulation(
         progress,
         populate_first_100,
         checkpoint_dir=checkpoint_dir,
+        retention=retention,
     )
     result["p"] = float(p)
     result["p_applied"] = True
@@ -1485,16 +1989,93 @@ def _snapshot_patch_count(checkpoint_file, expected_shape, result_timestep):
     return timestep, patches
 
 
+def _result_timestep(results):
+    """Return the simulation time a result or state was taken at."""
+    result_timestep = results.get("timestep")
+    if result_timestep is None:
+        result_timestep = np.asarray(results["tracked_timesteps"])[-1]
+    return int(result_timestep)
+
+
+def _stored_patch_series(timesteps, patches, result_timestep):
+    """Keep the counted samples of a stored series up to the result time."""
+    timesteps = np.asarray(timesteps, dtype=np.int64)
+    patches = np.asarray(patches, dtype=np.int64)
+    if timesteps.size != patches.size or not timesteps.size:
+        return None
+    usable = (patches >= 0) & (timesteps <= result_timestep)
+    if not np.any(usable):
+        return None
+    return timesteps[usable].copy(), patches[usable].copy()
+
+
+def _recorded_patchiness_history(results, checkpoint_dir=None):
+    """Read the patch series a run stored, or None when it stored none.
+
+    Reading the record is what makes a pruned run plottable: the lattices
+    that produced the counts are gone, but the counts themselves were saved
+    while those lattices were still in memory.
+    """
+    result_timestep = _result_timestep(results)
+
+    # An explicitly named directory wins over whatever the result remembers.
+    if checkpoint_dir is not None:
+        analysis = load_analysis(checkpoint_dir)
+        if analysis is not None:
+            return _stored_patch_series(
+                analysis["tracked_timesteps"],
+                analysis["patch_history"],
+                result_timestep,
+            )
+        return None
+
+    if results.get("patch_history") is not None:
+        series = _stored_patch_series(
+            results["tracked_timesteps"],
+            results["patch_history"],
+            result_timestep,
+        )
+        if series is not None:
+            return series
+
+    for key in ("analysis_path", "checkpoint_path"):
+        location = results.get(key)
+        if location:
+            analysis = load_analysis(location)
+            if analysis is not None:
+                return _stored_patch_series(
+                    analysis["tracked_timesteps"],
+                    analysis["patch_history"],
+                    result_timestep,
+                )
+    for path in results.get("checkpoint_files", ()) or ():
+        analysis = load_analysis(path)
+        if analysis is not None:
+            return _stored_patch_series(
+                analysis["tracked_timesteps"],
+                analysis["patch_history"],
+                result_timestep,
+            )
+    return None
+
+
 def _load_patchiness_history(results, checkpoint_dir=None):
-    """Count patches in each available snapshot through the result time."""
+    """Return the patch series, preferring the one the run recorded.
+
+    Runs written before analysis records existed, and legs that never
+    checkpointed, fall back to counting each snapshot still on disk.
+    """
+    recorded = _recorded_patchiness_history(
+        results, checkpoint_dir=checkpoint_dir
+    )
+    if recorded is not None:
+        return recorded
+
     checkpoint_files = _patchiness_checkpoint_files(
         results, checkpoint_dir=checkpoint_dir
     )
     expected_shape = np.asarray(results["lattice"]).shape
-    result_timestep = results.get("timestep")
-    if result_timestep is None:
-        result_timestep = np.asarray(results["tracked_timesteps"])[-1]
-    result_timestep = int(result_timestep)
+    result_timestep = _result_timestep(results)
 
     # Checkpoint filenames carry their own simulation time, so snapshots past
     # the result time can be dropped without reading their lattices. A name
