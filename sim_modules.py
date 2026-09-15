@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import os
@@ -1419,13 +1420,69 @@ def _patchiness_checkpoint_files(results, checkpoint_dir=None):
                 "checkpoint metadata"
             )
 
-    unique_candidates = {str(path.resolve()): path for path in candidates}
+    # normcase(abspath(...)) deduplicates with string work alone; resolve()
+    # costs one filesystem call per path, which is seconds for a long run.
+    unique_candidates = {
+        os.path.normcase(os.path.abspath(path)): path for path in candidates
+    }
     checkpoint_files = sorted(
         unique_candidates.values(), key=_checkpoint_timestep
     )
     if not checkpoint_files:
         raise FileNotFoundError("no checkpoint_*.npz files found")
     return checkpoint_files
+
+
+# Checkpoints are written once and never rewritten, so a patch count keyed on
+# a file's identity, size and modification time stays valid for the session.
+# Re-plotting a long run would otherwise re-read every lattice from disk.
+_PATCH_COUNT_CACHE = {}
+
+
+def _snapshot_patch_count(checkpoint_file, expected_shape, result_timestep):
+    """Count one snapshot's patches, reusing a cached count when possible.
+
+    Returns ``(timestep, patches)``, or ``None`` when the snapshot is later
+    than the result time and therefore not part of the history.
+    """
+    status = os.stat(checkpoint_file)
+    cache_key = (
+        os.path.normcase(os.path.abspath(checkpoint_file)),
+        status.st_size,
+        status.st_mtime_ns,
+    )
+    cached = _PATCH_COUNT_CACHE.get(cache_key)
+    if cached is not None:
+        timestep, patches, cached_shape = cached
+        if cached_shape != expected_shape:
+            raise ValueError(
+                f"checkpoint {checkpoint_file} has lattice shape "
+                f"{cached_shape}; expected {expected_shape}"
+            )
+        return None if timestep > result_timestep else (timestep, patches)
+
+    with np.load(checkpoint_file, allow_pickle=False) as saved:
+        missing = {"lattice", "timestep"}.difference(saved.files)
+        if missing:
+            raise ValueError(
+                f"checkpoint {checkpoint_file} is missing: "
+                f"{', '.join(sorted(missing))}"
+            )
+        timestep = int(saved["timestep"])
+        if timestep > result_timestep:
+            return None
+        checkpoint_lattice = saved["lattice"]
+        if checkpoint_lattice.shape != expected_shape:
+            raise ValueError(
+                f"checkpoint {checkpoint_file} has lattice shape "
+                f"{checkpoint_lattice.shape}; expected {expected_shape}"
+            )
+        patches = count_patches(checkpoint_lattice)
+
+    _PATCH_COUNT_CACHE[cache_key] = (
+        timestep, patches, checkpoint_lattice.shape
+    )
+    return timestep, patches
 
 
 def _load_patchiness_history(results, checkpoint_dir=None):
@@ -1439,27 +1496,32 @@ def _load_patchiness_history(results, checkpoint_dir=None):
         result_timestep = np.asarray(results["tracked_timesteps"])[-1]
     result_timestep = int(result_timestep)
 
-    patches_by_timestep = {}
-    for checkpoint_file in checkpoint_files:
-        with np.load(checkpoint_file, allow_pickle=False) as saved:
-            missing = {"lattice", "timestep"}.difference(saved.files)
-            if missing:
-                raise ValueError(
-                    f"checkpoint {checkpoint_file} is missing: "
-                    f"{', '.join(sorted(missing))}"
-                )
-            timestep = int(saved["timestep"])
-            if timestep > result_timestep:
-                continue
-            checkpoint_lattice = saved["lattice"]
-            if checkpoint_lattice.shape != expected_shape:
-                raise ValueError(
-                    f"checkpoint {checkpoint_file} has lattice shape "
-                    f"{checkpoint_lattice.shape}; expected {expected_shape}"
-                )
-            patches_by_timestep[timestep] = count_patches(
-                checkpoint_lattice
-            )
+    # Checkpoint filenames carry their own simulation time, so snapshots past
+    # the result time can be dropped without reading their lattices. A name
+    # that does not parse is still opened and judged on its stored timestep.
+    eligible_files = [
+        checkpoint_file
+        for checkpoint_file in checkpoint_files
+        if _checkpoint_timestep(checkpoint_file) <= result_timestep
+    ]
+
+    def count_one(checkpoint_file):
+        return _snapshot_patch_count(
+            checkpoint_file, expected_shape, result_timestep
+        )
+
+    # Reading a snapshot is dominated by file I/O, which releases the GIL, so
+    # a small thread pool cuts the wall time of a long history several-fold.
+    worker_count = min(8, len(eligible_files))
+    if worker_count > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            counted = list(pool.map(count_one, eligible_files))
+    else:
+        counted = [count_one(path) for path in eligible_files]
+
+    patches_by_timestep = {
+        timestep: patches for timestep, patches in filter(None, counted)
+    }
 
     if not patches_by_timestep:
         raise ValueError(
@@ -1554,11 +1616,47 @@ def _load_lattice_snapshot(results, lattice_timestep, checkpoint_dir=None):
     return lattice, selected_timestep
 
 
+def _validate_smoothing_sigma(value):
+    """Return one optional positive, finite Gaussian smoothing width."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError("smooth_sigma must be a real number or None")
+    value = float(value)
+    if not np.isfinite(value):
+        raise ValueError("smooth_sigma must be finite")
+    if value <= 0:
+        raise ValueError("smooth_sigma must be positive")
+    return value
+
+
+def _gaussian_smooth(values, sigma, truncate=4.0):
+    """Smooth a time series with a Gaussian kernel of width ``sigma``.
+
+    ``sigma`` is measured in samples of the series, matching the convention
+    of ``scipy.ndimage.gaussian_filter1d``. The kernel is cut off at
+    ``truncate`` standard deviations and the ends are reflected, so the first
+    and last points are not dragged towards zero.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.size < 2:
+        return values.copy()
+    radius = max(int(truncate * sigma + 0.5), 1)
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / sigma) ** 2)
+    kernel /= kernel.sum()
+    padded = np.pad(values, radius, mode="reflect")
+    return np.convolve(padded, kernel, mode="valid")
+
+
 def show_results(
     results,
     show_patchiness=False,
     checkpoint_dir=None,
     lattice_timestep=None,
+    smooth_sigma=None,
 ):
     """Plot a lattice snapshot and the full diversity/patchiness history.
 
@@ -1569,9 +1667,16 @@ def show_results(
     ``lattice_timestep`` is supplied, the lattice nearest to that simulation
     time is loaded from the available checkpoints. The time-series plots are
     still drawn through the full result time.
+
+    ``smooth_sigma`` draws a Gaussian-smoothed living-species curve, and a
+    smoothed patchiness curve when one is shown, over a faded copy of the
+    raw series. The width is given in tracked samples rather than timesteps,
+    so a run tracked every ``track_every`` steps is smoothed over roughly
+    ``smooth_sigma * track_every`` simulation time.
     """
     if not isinstance(show_patchiness, (bool, np.bool_)):
         raise TypeError("show_patchiness must be True or False")
+    smooth_sigma = _validate_smoothing_sigma(smooth_sigma)
 
     lattice = results["lattice"]
     selected_timestep = None
@@ -1619,26 +1724,61 @@ def show_results(
     )
     ax_lattice.set_axis_off()
 
-    diversity_line, = ax_diversity.plot(
-        results["tracked_timesteps"],
-        results["diversity_history"],
-        color="tab:blue",
-        label="Living species",
-        lw=1.5,
-    )
+    diversity_timesteps = results["tracked_timesteps"]
+    diversity_history = results["diversity_history"]
+    if smooth_sigma is None:
+        diversity_line, = ax_diversity.plot(
+            diversity_timesteps,
+            diversity_history,
+            color="tab:blue",
+            label="Living species",
+            lw=1.5,
+        )
+    else:
+        # The raw series stays visible underneath the smoothed curve.
+        ax_diversity.plot(
+            diversity_timesteps,
+            diversity_history,
+            color="tab:blue",
+            lw=1.0,
+            alpha=0.25,
+        )
+        diversity_line, = ax_diversity.plot(
+            diversity_timesteps,
+            _gaussian_smooth(diversity_history, smooth_sigma),
+            color="tab:blue",
+            label="Living species",
+            lw=1.8,
+        )
     ax_diversity.set(xlabel="Timestep", ylabel="Living species", title="Diversity")
     ax_diversity.grid(alpha=0.25)
 
     if patchiness_history is not None:
         patch_timesteps, patch_counts = patchiness_history
         ax_patchiness = ax_diversity.twinx()
-        patchiness_line, = ax_patchiness.plot(
-            patch_timesteps,
-            patch_counts,
-            color="tab:orange",
-            label="Species patches",
-            lw=1.5,
-        )
+        if smooth_sigma is None:
+            patchiness_line, = ax_patchiness.plot(
+                patch_timesteps,
+                patch_counts,
+                color="tab:orange",
+                label="Species patches",
+                lw=1.5,
+            )
+        else:
+            ax_patchiness.plot(
+                patch_timesteps,
+                patch_counts,
+                color="tab:orange",
+                lw=1.0,
+                alpha=0.25,
+            )
+            patchiness_line, = ax_patchiness.plot(
+                patch_timesteps,
+                _gaussian_smooth(patch_counts, smooth_sigma),
+                color="tab:orange",
+                label="Species patches",
+                lw=1.8,
+            )
         ax_patchiness.set_ylabel("Species patches", color="tab:orange")
         ax_patchiness.tick_params(axis="y", labelcolor="tab:orange")
         ax_patchiness.yaxis.set_major_formatter(
@@ -1647,6 +1787,12 @@ def show_results(
         ax_diversity.set_title("Diversity and patchiness")
         ax_diversity.legend(
             handles=[diversity_line, patchiness_line], loc="best"
+        )
+
+    if smooth_sigma is not None:
+        ax_diversity.set_title(
+            f"{ax_diversity.get_title()} "
+            f"(Gaussian sigma = {smooth_sigma:g} samples)"
         )
 
     plt.tight_layout()

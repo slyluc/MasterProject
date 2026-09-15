@@ -278,6 +278,134 @@ class ShowResultsPatchinessTests(unittest.TestCase):
             MS.show_results(results, show_patchiness="yes")
 
 
+class GaussianSmoothingTests(unittest.TestCase):
+    def tearDown(self):
+        plt.close("all")
+
+    def test_constant_series_and_length_are_preserved(self):
+        values = np.full(50, 7.0)
+
+        smoothed = MS._gaussian_smooth(values, 3.0)
+
+        self.assertEqual(smoothed.shape, values.shape)
+        np.testing.assert_allclose(smoothed, 7.0)
+
+    def test_impulse_response_matches_the_gaussian_kernel(self):
+        values = np.zeros(101)
+        values[50] = 1.0
+        expected = np.exp(-0.5 * ((np.arange(101) - 50) / 4.0) ** 2)
+        expected /= expected.sum()
+
+        smoothed = MS._gaussian_smooth(values, 4.0)
+
+        # The 4-sigma cut-off leaves a small, symmetric truncation error.
+        np.testing.assert_allclose(smoothed, expected, atol=1e-4)
+
+    def test_short_series_is_returned_unchanged(self):
+        np.testing.assert_array_equal(
+            MS._gaussian_smooth(np.array([4.0]), 2.0), [4.0]
+        )
+
+    def test_sigma_validation(self):
+        for value in ("3", True, [1.0]):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    MS._validate_smoothing_sigma(value)
+        for value in (0, -1.0, np.nan, np.inf):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    MS._validate_smoothing_sigma(value)
+        self.assertIsNone(MS._validate_smoothing_sigma(None))
+        self.assertEqual(MS._validate_smoothing_sigma(2), 2.0)
+
+    def test_plot_draws_raw_and_smoothed_curves_on_both_axes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            ShowResultsPatchinessTests._write_test_checkpoints(directory)
+            state = MS.load_checkpoint(directory)
+
+            with patch.object(MS.plt, "show"):
+                MS.show_results(
+                    state, show_patchiness=True, smooth_sigma=1.0
+                )
+
+        figure = plt.gcf()
+        diversity_axis, patchiness_axis = figure.axes[1], figure.axes[2]
+        self.assertEqual(len(diversity_axis.lines), 2)
+        self.assertEqual(len(patchiness_axis.lines), 2)
+        self.assertIn("sigma = 1", diversity_axis.get_title())
+
+        # The faded raw series is drawn first, the smoothed curve over it.
+        np.testing.assert_array_equal(
+            patchiness_axis.lines[0].get_ydata(), [1, 4]
+        )
+        np.testing.assert_allclose(
+            patchiness_axis.lines[1].get_ydata(),
+            MS._gaussian_smooth([1, 4], 1.0),
+        )
+        self.assertLess(diversity_axis.lines[0].get_alpha(), 1.0)
+        self.assertIsNone(diversity_axis.lines[1].get_alpha())
+
+    def test_unsmoothed_plot_keeps_a_single_curve(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            ShowResultsPatchinessTests._write_test_checkpoints(directory)
+            state = MS.load_checkpoint(directory)
+
+            with patch.object(MS.plt, "show"):
+                MS.show_results(state, show_patchiness=True)
+
+        figure = plt.gcf()
+        self.assertEqual(len(figure.axes[1].lines), 1)
+        self.assertEqual(len(figure.axes[2].lines), 1)
+        self.assertEqual(
+            figure.axes[1].get_title(), "Diversity and patchiness"
+        )
+
+    def test_invalid_sigma_is_rejected_by_show_results(self):
+        results = ShowResultsPatchinessTests._checkpoint_state(
+            np.ones((2, 2), dtype=np.int64), 1, [1, 1]
+        )
+        results["diversity"] = 1
+
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            MS.show_results(results, smooth_sigma=0)
+        with self.assertRaisesRegex(TypeError, "real number or None"):
+            MS.show_results(results, smooth_sigma="wide")
+
+
+class PatchinessCacheTests(unittest.TestCase):
+    def setUp(self):
+        MS._PATCH_COUNT_CACHE.clear()
+
+    def test_repeated_history_reads_each_snapshot_once(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            ShowResultsPatchinessTests._write_test_checkpoints(directory)
+            results = MS.load_checkpoint(directory)
+
+            first = MS._load_patchiness_history(results)
+            with patch.object(
+                MS.np, "load", side_effect=AssertionError("re-read")
+            ):
+                second = MS._load_patchiness_history(results)
+
+        np.testing.assert_array_equal(first[0], second[0])
+        np.testing.assert_array_equal(first[1], second[1])
+        np.testing.assert_array_equal(second[1], [1, 4])
+
+    def test_cached_count_still_checks_the_expected_lattice_shape(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            ShowResultsPatchinessTests._write_test_checkpoints(directory)
+            results = MS.load_checkpoint(directory)
+            MS._load_patchiness_history(results)
+
+            results["lattice"] = np.ones((3, 3), dtype=np.int64)
+            with self.assertRaisesRegex(ValueError, "lattice shape"):
+                MS._load_patchiness_history(results)
+
+
 class AnimateLatticeTests(unittest.TestCase):
     def tearDown(self):
         plt.close("all")
