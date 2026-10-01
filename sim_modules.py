@@ -2,11 +2,12 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
 from matplotlib.colors import BoundaryNorm, ListedColormap
-from matplotlib.ticker import StrMethodFormatter
+from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -721,6 +722,614 @@ def load_analysis(path):
     record["initial_newest_species"] = _initial_newest_species(record)
     record["analysis_path"] = str(analysis_path.resolve())
     return record
+
+
+def _directed_cycle_counts(Gamma, max_cycle_length):
+    """Count simple directed cycles, identifying rotations of one cycle.
+
+    The matrix formulas give exact counts through length four, including
+    mutual-invasion pairs. Longer cycles use a bounded depth-first search.
+    """
+    adjacency = np.asarray(Gamma) != 0
+    if adjacency.ndim != 2 or adjacency.shape[0] != adjacency.shape[1]:
+        raise ValueError("Gamma must be a square matrix")
+    adjacency = adjacency.copy()
+    np.fill_diagonal(adjacency, False)
+    size = adjacency.shape[0]
+    counts = {length: 0 for length in range(2, max_cycle_length + 1)}
+    if size < 2:
+        return counts
+
+    reciprocal = int(np.count_nonzero(adjacency & adjacency.T))
+    counts[2] = reciprocal // 2
+    if max_cycle_length >= 3:
+        matrix = adjacency.astype(np.float64)
+        two_steps = matrix @ matrix
+        counts[3] = int(round(float(np.sum(two_steps * matrix.T)))) // 3
+    if max_cycle_length >= 4:
+        closed_four = int(round(float(np.sum(two_steps * two_steps.T))))
+        repeated_vertices = int(round(float(np.sum(np.diag(two_steps) ** 2))))
+        counts[4] = (closed_four - 2 * repeated_vertices + reciprocal) // 4
+
+    if max_cycle_length > 4:
+        neighbors = [np.flatnonzero(row).tolist() for row in adjacency]
+        search_steps = 0
+        step_limit = 10_000_000
+
+        def visit(start, vertex, visited, length):
+            nonlocal search_steps
+            for neighbor in neighbors[vertex]:
+                search_steps += 1
+                if search_steps > step_limit:
+                    raise ValueError(
+                        "cycle search exceeded 10 million steps; reduce "
+                        "max_cycle_length or select fewer/smaller checkpoints"
+                    )
+                if neighbor == start:
+                    if length >= 5:
+                        counts[length] += 1
+                elif (
+                    neighbor > start
+                    and neighbor not in visited
+                    and length < max_cycle_length
+                ):
+                    visited.add(neighbor)
+                    visit(start, neighbor, visited, length + 1)
+                    visited.remove(neighbor)
+
+        for start in range(size):
+            visit(start, start, {start}, 1)
+    return counts
+
+
+@njit
+def _log_add_cycles(first, second):
+    """Add positive counts represented by their natural logarithms."""
+    if first == -np.inf:
+        return second
+    if second == -np.inf:
+        return first
+    larger = max(first, second)
+    return larger + np.log1p(np.exp(min(first, second) - larger))
+
+
+@njit
+def _sample_long_cycle_logs(adjacency, offsets, edges, samples,
+                            max_length, seed):
+    """Estimate all long simple-cycle counts with weighted random paths.
+
+    A cycle is rooted at its smallest vertex. Each step chooses uniformly
+    among unvisited larger neighbors. The product of branch counts is the
+    inverse probability of that path, so its closure weight is an unbiased
+    contribution to the count for that length.
+    """
+    np.random.seed(seed)
+    size = adjacency.shape[0]
+    log_totals = np.full(max_length + 1, -np.inf)
+    hits = np.zeros(max_length + 1, dtype=np.int64)
+    visited = np.zeros(size, dtype=np.bool_)
+    path = np.empty(size, dtype=np.int64)
+    candidates = np.empty(size, dtype=np.int64)
+    if samples >= size:
+        repetitions = (samples + size - 1) // size
+        draws = size * repetitions
+        log_root_weight = -np.log(float(repetitions))
+    else:
+        repetitions = 0
+        draws = samples
+        log_root_weight = np.log(float(size) / float(samples))
+
+    for draw in range(draws):
+        root = draw // repetitions if repetitions else np.random.randint(size)
+        visited[root] = True
+        path[0] = root
+        vertex = root
+        length = 1
+        log_weight = log_root_weight
+        while True:
+            if length >= 5 and adjacency[vertex, root]:
+                log_totals[length] = _log_add_cycles(
+                    log_totals[length], log_weight
+                )
+                hits[length] += 1
+            if length >= max_length:
+                break
+            choices = 0
+            for edge_index in range(offsets[vertex], offsets[vertex + 1]):
+                neighbor = edges[edge_index]
+                if neighbor > root and not visited[neighbor]:
+                    candidates[choices] = neighbor
+                    choices += 1
+            if choices == 0:
+                break
+            vertex = candidates[np.random.randint(choices)]
+            log_weight += np.log(float(choices))
+            visited[vertex] = True
+            path[length] = vertex
+            length += 1
+        for path_index in range(length):
+            visited[path[path_index]] = False
+    return log_totals, hits
+
+
+def _cycle_histogram_for_gamma(Gamma, max_cycle_length, samples, seed):
+    """Return counts, natural-log counts, and long-cycle sample hits."""
+    adjacency = np.asarray(Gamma) != 0
+    if adjacency.ndim != 2 or adjacency.shape[0] != adjacency.shape[1]:
+        raise ValueError("Gamma must be a square matrix")
+    size = adjacency.shape[0]
+    limit = size if max_cycle_length is None else min(max_cycle_length, size)
+    counts = _directed_cycle_counts(Gamma, min(max(limit, 2), 4))
+    logs = {
+        length: math.log(count) if count else -math.inf
+        for length, count in counts.items()
+    }
+    hits = {}
+    estimated = set()
+    if limit <= 4:
+        return counts, logs, hits, estimated
+
+    # Small graphs can be enumerated in full. Larger graphs may contain an
+    # exponential number of simple cycles, so sample long ones instead.
+    if size <= 12:
+        try:
+            counts = _directed_cycle_counts(Gamma, limit)
+        except ValueError as error:
+            if "cycle search exceeded" not in str(error):
+                raise
+        else:
+            logs = {
+                length: math.log(count) if count else -math.inf
+                for length, count in counts.items()
+            }
+            return counts, logs, hits, estimated
+
+    adjacency = adjacency.copy()
+    np.fill_diagonal(adjacency, False)
+    degrees = np.count_nonzero(adjacency, axis=1)
+    offsets = np.empty(size + 1, dtype=np.int64)
+    offsets[0] = 0
+    offsets[1:] = np.cumsum(degrees)
+    edges = np.nonzero(adjacency)[1].astype(np.int64)
+    sampled_logs, sampled_hits = _sample_long_cycle_logs(
+        adjacency, offsets, edges, samples, limit, seed
+    )
+    for length in range(5, limit + 1):
+        log_count = float(sampled_logs[length])
+        logs[length] = log_count
+        counts[length] = math.exp(log_count) if log_count < 700 else math.inf
+        hits[length] = int(sampled_hits[length])
+        estimated.add(length)
+    return counts, logs, hits, estimated
+
+
+def _fit_cycle_trend(log10_counts, model, min_length=2, max_length=None):
+    """Fit either a power law or an exponential to positive cycle counts."""
+    lengths = np.asarray(
+        [length for length, value in log10_counts.items()
+         if length >= min_length
+         and (max_length is None or length <= max_length)
+         and np.isfinite(value)], dtype=np.float64
+    )
+    if lengths.size < 2:
+        raise ValueError(
+            "a cycle-count fit needs at least two cycle lengths with "
+            "positive counts"
+        )
+    log_counts = np.asarray(
+        [log10_counts[int(length)] * math.log(10) for length in lengths]
+    )
+    predictor = np.log(lengths) if model == "power_law" else lengths
+    slope, log_constant = np.polyfit(predictor, log_counts, 1)
+    fitted = log_constant + slope * predictor
+    residual = float(np.sum((log_counts - fitted) ** 2))
+    total = float(np.sum((log_counts - np.mean(log_counts)) ** 2))
+    fit = {
+        "model": model,
+        "constant": (math.exp(log_constant)
+                     if -700 < log_constant < 700 else None),
+        "log10_constant": float(log_constant / math.log(10)),
+        "r_squared_log_space": 1.0 - residual / total if total else 1.0,
+        "lengths_used": lengths.astype(np.int64),
+    }
+    if model == "power_law":
+        fit["exponent"] = float(-slope)
+    else:
+        fit["rate"] = float(slope)
+    return fit
+
+
+def _fit_cycle_power_law(log10_counts, min_length=2, max_length=None):
+    """Fit count = constant * length**(-exponent) in log-log space."""
+    return _fit_cycle_trend(
+        log10_counts, "power_law", min_length, max_length
+    )
+
+
+def _fit_cycle_exponential(log10_counts, min_length=2, max_length=None):
+    """Fit count = constant * exp(rate * length) in semi-log space."""
+    return _fit_cycle_trend(
+        log10_counts, "exponential", min_length, max_length
+    )
+
+
+def show_gamma_cycle_histogram(
+    checkpoint_dir,
+    event_type="collapse",
+    side=None,
+    event_index="all",
+    window=None,
+    max_cycle_length=None,
+    log_x=False,
+    log_y=False,
+    samples_per_checkpoint=5000,
+    seed=0,
+    fit_power_law=False,
+    power_law_min_length=2,
+    power_law_max_length=None,
+    fit_model=None,
+    fit_min_length=None,
+    fit_max_length=None,
+):
+    """Plot directed invasion-cycle counts around diversity switches.
+
+    ``checkpoint_dir`` is one run folder with ``analysis.npz`` and retained
+    checkpoints. ``event_type`` is "collapse" or "generation" (recovery).
+    ``event_index='all'`` (also ``None``) combines all matching switches;
+    an integer chooses one, zero-based among switches of that type. The
+    default side is before collapses and after generations. ``side`` can
+    override it. ``window`` optionally limits distance from each switch.
+
+    All possible cycle lengths are considered by default. Counts through
+    length four are exact. Longer lengths are estimated by weighted sampling
+    of simple paths when exhaustive counting is too large; increase
+    ``samples_per_checkpoint`` for a more stable estimate. Rotations of a
+    cycle count once per snapshot, and counts sum across snapshots. The
+    returned ``sample_hits`` shows how many sampled paths closed at each
+    estimated length; zero hits do not prove that length is absent.
+
+    ``fit_power_law=True`` fits ``count = C * length**(-alpha)`` to all
+    positive histogram bins between ``power_law_min_length`` and
+    ``power_law_max_length`` (inclusive) by ordinary least squares in log-log
+    space. ``fit_model='exponential'`` instead fits ``count = A * exp(k*length)``
+    in semi-log space. ``fit_min_length`` and ``fit_max_length`` set the fit
+    interval for either model. The curve and fitted parameters appear in the
+    legend.
+    """
+    directory = Path(checkpoint_dir).expanduser()
+    if not directory.is_dir():
+        raise ValueError("checkpoint_dir must be a checkpoint folder")
+    if event_type not in ("collapse", "generation"):
+        raise ValueError("event_type must be 'collapse' or 'generation'")
+    if side is None:
+        side = "before" if event_type == "collapse" else "after"
+    if side not in ("before", "after"):
+        raise ValueError("side must be 'before' or 'after'")
+    if event_index not in (None, "all") and (
+        isinstance(event_index, (bool, np.bool_))
+        or not isinstance(event_index, (int, np.integer))
+        or event_index < 0
+    ):
+        raise ValueError(
+            "event_index must be 'all', None, or a non-negative integer"
+        )
+    if window is not None and (
+        isinstance(window, (bool, np.bool_))
+        or not isinstance(window, (int, np.integer))
+        or window <= 0
+    ):
+        raise ValueError("window must be a positive integer or None")
+    if max_cycle_length is not None and (
+        isinstance(max_cycle_length, (bool, np.bool_))
+        or not isinstance(max_cycle_length, (int, np.integer))
+        or max_cycle_length < 2
+    ):
+        raise ValueError(
+            "max_cycle_length must be None or an integer of at least 2"
+        )
+    if (
+        isinstance(samples_per_checkpoint, (bool, np.bool_))
+        or not isinstance(samples_per_checkpoint, (int, np.integer))
+        or samples_per_checkpoint < 1
+    ):
+        raise ValueError("samples_per_checkpoint must be a positive integer")
+    if (
+        isinstance(seed, (bool, np.bool_))
+        or not isinstance(seed, (int, np.integer))
+        or seed < 0
+    ):
+        raise ValueError("seed must be a non-negative integer")
+    if not isinstance(log_x, (bool, np.bool_)) or not isinstance(
+        log_y, (bool, np.bool_)
+    ):
+        raise TypeError("log_x and log_y must be True or False")
+    if not isinstance(fit_power_law, (bool, np.bool_)):
+        raise TypeError("fit_power_law must be True or False")
+    if fit_model not in (None, "power_law", "exponential"):
+        raise ValueError("fit_model must be None, 'power_law', or 'exponential'")
+    if fit_power_law and fit_model == "exponential":
+        raise ValueError("choose fit_power_law or fit_model='exponential'")
+    selected_fit_model = (
+        fit_model or ("power_law" if fit_power_law else None)
+    )
+    if (
+        isinstance(power_law_min_length, (bool, np.bool_))
+        or not isinstance(power_law_min_length, (int, np.integer))
+        or power_law_min_length < 2
+    ):
+        raise ValueError("power_law_min_length must be an integer of at least 2")
+    if power_law_max_length is not None and (
+        isinstance(power_law_max_length, (bool, np.bool_))
+        or not isinstance(power_law_max_length, (int, np.integer))
+        or power_law_max_length < power_law_min_length
+    ):
+        raise ValueError(
+            "power_law_max_length must be None or an integer at least "
+            "power_law_min_length"
+        )
+    if fit_min_length is not None and (
+        isinstance(fit_min_length, (bool, np.bool_))
+        or not isinstance(fit_min_length, (int, np.integer))
+        or fit_min_length < 2
+    ):
+        raise ValueError("fit_min_length must be None or an integer of at least 2")
+    effective_fit_min = (
+        power_law_min_length if fit_min_length is None else fit_min_length
+    )
+    effective_fit_max = (
+        power_law_max_length if fit_max_length is None else fit_max_length
+    )
+    if effective_fit_max is not None and (
+        isinstance(effective_fit_max, (bool, np.bool_))
+        or not isinstance(effective_fit_max, (int, np.integer))
+        or effective_fit_max < effective_fit_min
+    ):
+        raise ValueError(
+            "fit_max_length must be None or an integer at least fit_min_length"
+        )
+
+    analysis = load_analysis(directory)
+    if analysis is None:
+        raise FileNotFoundError(f"analysis.npz not found in {directory}")
+    times = np.asarray(analysis["tracked_timesteps"], dtype=np.int64)
+    diversity = np.asarray(analysis["diversity_history"], dtype=np.float64)
+    events = np.asarray(analysis["event_timesteps"], dtype=np.int64)
+    if times.size == 0 or times.shape != diversity.shape:
+        raise ValueError("analysis has no aligned diversity history")
+    if not events.size:
+        raise ValueError("analysis contains no diversity switches")
+
+    # Stored events may include several nearby estimates of one transition.
+    # The detector records the sample where a threshold is crossed, so the
+    # smoothed change into that sample identifies its direction.
+    smoothed = _moving_average(diversity, 5)
+    directions = []
+    for event in events:
+        index = int(np.searchsorted(times, event))
+        if index >= times.size or int(times[index]) != int(event):
+            raise ValueError("event timestep is absent from tracked history")
+        change = smoothed[index] - smoothed[max(0, index - 1)]
+        if change == 0:
+            change = smoothed[min(times.size - 1, index + 1)] - smoothed[
+                max(0, index - 2)
+            ]
+        if change == 0:
+            change = diversity[index] - diversity[max(0, index - 1)]
+        directions.append("generation" if change > 0 else "collapse")
+
+    matching = [i for i, direction in enumerate(directions)
+                if direction == event_type]
+    if not matching:
+        raise ValueError(f"analysis contains no {event_type} events")
+    if event_index not in (None, "all"):
+        if event_index >= len(matching):
+            raise IndexError(
+                f"event_index {event_index} is out of range for "
+                f"{len(matching)} {event_type} events"
+            )
+        matching = [matching[event_index]]
+
+    selected_events = events[matching]
+    checkpoint_paths = sorted(
+        directory.glob("checkpoint_*.npz"), key=_checkpoint_timestep
+    )
+    selected_paths = {}
+    for index in matching:
+        event = int(events[index])
+        if side == "before":
+            opposite = next(
+                (int(events[j]) for j in range(index - 1, -1, -1)
+                 if directions[j] != event_type),
+                int(times[0]) - 1,
+            )
+            selected = (
+                path for path in checkpoint_paths
+                if opposite <= _checkpoint_timestep(path) < event
+                and (window is None or _checkpoint_timestep(path) >= event - window)
+            )
+        else:
+            opposite = next(
+                (int(events[j]) for j in range(index + 1, len(events))
+                 if directions[j] != event_type),
+                int(times[-1]) + 1,
+            )
+            selected = (
+                path for path in checkpoint_paths
+                if event <= _checkpoint_timestep(path) < opposite
+                and (window is None or _checkpoint_timestep(path) <= event + window)
+            )
+        for path in selected:
+            selected_paths[_checkpoint_timestep(path)] = path
+
+    if not selected_paths:
+        raise ValueError(
+            "no retained Gamma checkpoints on the selected side of the "
+            "switch; try another event, side, or window"
+        )
+
+    exact_counts = {}
+    aggregate_logs = {}
+    sample_hits = {}
+    estimated_lengths = set()
+    per_checkpoint_counts = {}
+    checkpoint_timesteps = sorted(selected_paths)
+    for timestep in checkpoint_timesteps:
+        path = selected_paths[timestep]
+        with np.load(path, allow_pickle=False) as saved:
+            Gamma = saved["Gamma"]
+            if int(saved["timestep"]) != timestep:
+                raise ValueError(f"checkpoint timestep disagrees with {path}")
+            snapshot_seed = np.random.SeedSequence(
+                [int(seed), timestep & 0xffffffff, timestep >> 32]
+            ).generate_state(1)[0]
+            snapshot_counts, snapshot_logs, hits, estimated = (
+                _cycle_histogram_for_gamma(
+                    Gamma, max_cycle_length, samples_per_checkpoint,
+                    int(snapshot_seed),
+                )
+            )
+        per_checkpoint_counts[timestep] = snapshot_counts
+        for length, log_count in snapshot_logs.items():
+            aggregate_logs[length] = _log_add_cycles(
+                aggregate_logs.get(length, -math.inf), log_count
+            )
+        for length in range(2, min(4, len(Gamma)) + 1):
+            exact_counts[length] = exact_counts.get(length, 0) + int(
+                snapshot_counts[length]
+            )
+        for length, hit_count in hits.items():
+            sample_hits[length] = sample_hits.get(length, 0) + hit_count
+        estimated_lengths.update(estimated)
+
+    largest_length = max(aggregate_logs, default=2)
+    counts = {}
+    log10_counts = {}
+    for length in range(2, largest_length + 1):
+        if length in exact_counts:
+            counts[length] = exact_counts[length]
+            log_count = (math.log(counts[length]) if counts[length]
+                         else -math.inf)
+        else:
+            log_count = aggregate_logs.get(length, -math.inf)
+            counts[length] = (
+                math.exp(log_count) if log_count < 700 else math.inf
+            )
+        log10_counts[length] = log_count / math.log(10)
+
+    trend_fit = (
+        _fit_cycle_trend(
+            log10_counts, selected_fit_model,
+            effective_fit_min, effective_fit_max,
+        )
+        if selected_fit_model is not None else None
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    use_log10_values = any(value >= 700 for value in aggregate_logs.values())
+    exact_bars = [length for length in counts
+                  if length not in estimated_lengths and counts[length] > 0]
+    estimated_bars = [length for length in counts
+                      if length in estimated_lengths and counts[length] > 0]
+    if exact_bars or estimated_bars:
+        def heights(lengths):
+            return [log10_counts[length] if use_log10_values
+                    else counts[length] for length in lengths]
+
+        ax.bar(
+            exact_bars, heights(exact_bars),
+            width=0.8,
+            color="tab:blue",
+            edgecolor="white",
+            label="Exact (lengths 2–4)",
+        )
+        ax.bar(
+            estimated_bars, heights(estimated_bars),
+            width=0.8,
+            color="tab:orange",
+            edgecolor="white",
+            label="Estimated (longer cycles)",
+        )
+    else:
+        ax.text(0.5, 0.5, "No cycles in selected snapshots",
+                ha="center", va="center", transform=ax.transAxes)
+    if len(counts) <= 20:
+        ax.set_xticks(list(counts))
+    elif not log_x:
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
+    ax.set_xlabel("Cycle length (species)")
+    ax.set_ylabel(
+        "log10(count across Gamma snapshots)" if use_log10_values
+        else "Count across Gamma snapshots"
+    )
+    ax.set_title(
+        f"Invasion cycles {side} {event_type} "
+        f"({len(selected_events)} events, {len(checkpoint_timesteps)} snapshots)"
+    )
+    if log_x:
+        ax.set_xscale("log")
+        if len(counts) <= 20:
+            ax.set_xticks(list(counts), labels=[str(length) for length in counts])
+    if log_y and not use_log10_values:
+        ax.set_yscale("log")
+        if not exact_bars and not estimated_bars:
+            ax.set_ylim(0.8, 1.2)
+    if trend_fit is not None:
+        fit_lengths = trend_fit["lengths_used"]
+        curve_lengths = np.linspace(
+            float(fit_lengths[0]), float(fit_lengths[-1]), 200
+        )
+        log_curve = trend_fit["log10_constant"] * math.log(10)
+        if selected_fit_model == "power_law":
+            log_curve -= trend_fit["exponent"] * np.log(curve_lengths)
+        else:
+            log_curve += trend_fit["rate"] * curve_lengths
+        curve_counts = (
+            log_curve / math.log(10) if use_log10_values
+            else np.exp(log_curve)
+        )
+        constant = trend_fit["constant"]
+        constant_label = (
+            f"{constant:.3g}" if constant is not None
+            else f"10^{trend_fit['log10_constant']:.2f}"
+        )
+        if selected_fit_model == "power_law":
+            fit_label = (
+                f"Power law (L={fit_lengths[0]}–{fit_lengths[-1]}): "
+                f"C={constant_label}, alpha={trend_fit['exponent']:.3g}"
+            )
+        else:
+            fit_label = (
+                f"Exponential (L={fit_lengths[0]}–{fit_lengths[-1]}): "
+                f"A={constant_label}, k={trend_fit['rate']:.3g}"
+            )
+        ax.plot(
+            curve_lengths, curve_counts, color="tab:red", lw=2,
+            label=fit_label,
+        )
+    if estimated_bars or trend_fit is not None:
+        ax.legend()
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    plt.show()
+    return {
+        "cycle_counts": counts,
+        "log10_cycle_counts": log10_counts,
+        "per_checkpoint_counts": per_checkpoint_counts,
+        "estimated_lengths": sorted(estimated_lengths),
+        "sample_hits": sample_hits,
+        "plot_uses_log10_counts": use_log10_values,
+        "fit": trend_fit,
+        "power_law_fit": (
+            trend_fit if selected_fit_model == "power_law" else None
+        ),
+        "exponential_fit": (
+            trend_fit if selected_fit_model == "exponential" else None
+        ),
+        "event_timesteps": selected_events.copy(),
+        "checkpoint_timesteps": np.asarray(checkpoint_timesteps, dtype=np.int64),
+        "figure": fig,
+        "axes": ax,
+    }
 
 
 class _CheckpointRetention:

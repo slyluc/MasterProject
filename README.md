@@ -270,6 +270,58 @@ survive are those near a swap, so a request far from one resolves to the
 nearest kept snapshot. If checkpoint metadata is unavailable, use the same
 `checkpoint_dir` argument shown above.
 
+### Invasion cycles around diversity switches
+
+Use the run's recorded switches and surviving Gamma snapshots to count simple
+directed invasion cycles. The default side is the high-diversity side: before
+a collapse or after a generation/recovery event.
+
+```python
+cycles = MS.show_gamma_cycle_histogram(
+    "checkpoints/gamma_07_alpha_0125",
+    event_type="collapse",  # or "generation"
+    event_index="all",      # combine all matching switches (the default)
+    log_y=True,
+    fit_model="exponential",
+    fit_min_length=10,
+    fit_max_length=30,
+)
+print(cycles["cycle_counts"])
+print(cycles["exponential_fit"])
+```
+
+A straight trend with logarithmic count and linear cycle length corresponds
+to an exponential fit, `count = A * exp(k * length)`. The legend shows `A`
+and `k`. Set `fit_model="power_law"` (or the older `fit_power_law=True`) for
+`count = C * length**(-alpha)`, which is a straight trend only when **both**
+axes are logarithmic. `fit_min_length` and `fit_max_length` choose an
+inclusive range for either model; omitting them fits all positive histogram
+bins. At least two positive lengths are required. These are descriptive fits
+to the chosen bins, including estimated long-cycle counts.
+
+Set `event_index=0` for the first matching switch, `1` for the second, and so
+on. By default every possible cycle length is considered, up to the number
+of living species in each Gamma matrix. Counts for lengths 2–4 are exact;
+longer cycles are **estimates** from weighted random paths. Exact counting
+of all simple cycles can take
+exponential time. Increase `samples_per_checkpoint` (default 5,000) to make
+the longer-cycle estimates more stable; `seed` makes them reproducible.
+`cycles["estimated_lengths"]` identifies estimated bars and
+`cycles["sample_hits"]` reports how many sampled paths found each length.
+Zero hits do not establish that a cycle length is absent. You can still set
+`max_cycle_length` to focus on shorter cycles. For very large matrices,
+estimated counts can exceed floating-point range; use
+`cycles["log10_cycle_counts"]` in that case, which the plot switches to
+automatically.
+
+Pass `side="before"` or `side="after"` to override the default, and
+`window=100_000` to consider only that many timesteps from each switch.
+`log_x=True` also gives a logarithmic length axis. Counts sum over the
+selected checkpoints: a cycle that persists for ten snapshots is counted
+ten times. Rotating the same cycle does not count it again; opposite directed
+cycles count separately. Only retained checkpoints can be analysed, so
+pruned gaps contribute no Gamma matrices.
+
 ## Animate lattice evolution
 
 Animate a result directly in a notebook. Frames are loaded lazily,
