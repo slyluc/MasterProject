@@ -169,6 +169,23 @@ The saved lattice and Gamma are retained. New settings apply from that state;
 `gamma` affects links of newly introduced species. Existing blocked sites stay
 blocked, and `p` is not reapplied. Use a new checkpoint folder for each branch.
 
+A branch into a new folder starts its own history. Its diversity and patch
+series, `analysis.npz`, and species-introduced count begin at the state it
+starts from, so none of the source run's history is copied in. Simulation time
+is not reset: a branch from `checkpoint_000100000000.npz` with
+`T = 50_000_000` records timesteps 100M to 150M.
+
+Continuing into the folder the state came from extends that run instead, and
+keeps its full history:
+
+```python
+config.checkpoint_dir = "checkpoints/base_run"
+extended = config.run_main(initial_state=config.checkpoint_dir)
+```
+
+Pass `continue_history=True` or `False` to `run_main` or `run_percolation` to
+override either default. `config.resume()` always keeps the history.
+
 A previous result can be used directly:
 
 ```python
@@ -215,6 +232,24 @@ MS.show_results(
     checkpoint_dir="checkpoints/base_run",
 )
 ```
+
+To plot the curves from a later time, pass `start_timestep`. Use it to hide
+the copied source-run history in branch folders written before branches
+started their own:
+
+```python
+state = MS.load_checkpoint("checkpoints/gamma_075_alpha_0125")
+MS.show_results(
+    state,
+    show_patchiness=True,
+    smooth_sigma=20,
+    start_timestep=100_000_000,
+)
+```
+
+Samples before `start_timestep` are dropped before smoothing, so they do not
+bleed into the smoothed curve. The printed species-introduced count still
+covers the whole recorded history.
 
 To display the lattice nearest to a particular simulation timestep, pass
 `lattice_timestep`. The diversity and optional patchiness curves still cover

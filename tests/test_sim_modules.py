@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -361,6 +363,54 @@ class GaussianSmoothingTests(unittest.TestCase):
         self.assertEqual(
             figure.axes[1].get_title(), "Diversity and patchiness"
         )
+
+    def test_start_timestep_drops_earlier_samples_from_both_curves(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            ShowResultsPatchinessTests._write_test_checkpoints(directory)
+            state = MS.load_checkpoint(directory)
+
+            with patch.object(MS.plt, "show"):
+                MS.show_results(
+                    state,
+                    show_patchiness=True,
+                    smooth_sigma=1.0,
+                    start_timestep=2,
+                )
+
+        figure = plt.gcf()
+        diversity_axis, patchiness_axis = figure.axes[1], figure.axes[2]
+        for line in diversity_axis.lines + patchiness_axis.lines:
+            np.testing.assert_array_equal(line.get_xdata(), [2])
+        np.testing.assert_array_equal(
+            diversity_axis.lines[1].get_ydata(), [2]
+        )
+        np.testing.assert_array_equal(
+            patchiness_axis.lines[1].get_ydata(), [4]
+        )
+
+    def test_start_timestep_after_the_history_is_rejected(self):
+        results = ShowResultsPatchinessTests._checkpoint_state(
+            np.ones((2, 2), dtype=np.int64), 1, [1, 1]
+        )
+        results["diversity"] = 1
+
+        with self.assertRaisesRegex(ValueError, "at or after start_timestep"):
+            MS.show_results(results, start_timestep=5)
+        with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            MS.show_results(results, start_timestep=-1)
+
+    def test_species_introduced_counts_from_the_history_start(self):
+        results = ShowResultsPatchinessTests._checkpoint_state(
+            np.array([[7, 9], [9, 9]], dtype=np.int64), 1, [2, 2]
+        )
+        results["diversity"] = 2
+        results["initial_newest_species"] = 5
+
+        output = io.StringIO()
+        with patch.object(MS.plt, "show"), redirect_stdout(output):
+            MS.show_results(results)
+        self.assertIn("Species introduced:    4", output.getvalue())
 
     def test_invalid_sigma_is_rejected_by_show_results(self):
         results = ShowResultsPatchinessTests._checkpoint_state(

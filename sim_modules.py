@@ -31,7 +31,10 @@ class SimulationConfig:
     ``run_percolation()``. Validation is performed by the simulation function
     when the run starts. Set ``checkpoint_dir`` to enable disk snapshots. A
     saved or previous result can be continued with
-    ``run_main(initial_state=state)``.
+    ``run_main(initial_state=state)``. Continuing into the folder the state
+    came from extends that run's history; continuing into any other folder
+    starts a new history at the state's timestep. Pass ``continue_history``
+    to choose explicitly.
     """
 
     L_col: int
@@ -54,7 +57,7 @@ class SimulationConfig:
     # living species. Pass RetentionPolicy(keep_all=True) to keep every one.
     retention: "RetentionPolicy | None" = None
 
-    def run_main(self, initial_state=None):
+    def run_main(self, initial_state=None, continue_history=None):
         """Run the ordinary simulation using the current settings."""
         return main_simulation(
             L_col=self.L_col,
@@ -70,9 +73,10 @@ class SimulationConfig:
             initial_state=initial_state,
             checkpoint_dir=self.checkpoint_dir,
             retention=self.retention,
+            continue_history=continue_history,
         )
 
-    def run_percolation(self, initial_state=None):
+    def run_percolation(self, initial_state=None, continue_history=None):
         """Run the percolation simulation using the current settings."""
         return percolation_simulation(
             L_col=self.L_col,
@@ -89,6 +93,7 @@ class SimulationConfig:
             initial_state=initial_state,
             checkpoint_dir=self.checkpoint_dir,
             retention=self.retention,
+            continue_history=continue_history,
         )
 
     def resume(self, checkpoint=None):
@@ -122,6 +127,7 @@ class SimulationConfig:
             checkpoint_dir=output_dir,
             retention=self.retention,
             target_timestep=target,
+            continue_history=True,
         )
 
 
@@ -134,6 +140,45 @@ def _checkpoint_timestep(path):
         return int(path.stem.removeprefix("checkpoint_"))
     except ValueError:
         return -1
+
+
+def _initial_newest_species(record):
+    """Return the largest species ID at the start of a record's history.
+
+    Histories written before this was stored always began at their run's own
+    start, where the largest ID equals the number of species present.
+    """
+    initial_newest = record.get("initial_newest_species")
+    if initial_newest is None:
+        initial_newest = np.asarray(record["diversity_history"])[0]
+    return int(initial_newest)
+
+
+def _state_directory(state):
+    """Return the checkpoint folder a loaded state or result came from."""
+    for key in ("checkpoint_path", "analysis_path"):
+        location = state.get(key)
+        if location:
+            return Path(location).expanduser().parent
+    checkpoint_files = state.get("checkpoint_files") or ()
+    if checkpoint_files:
+        return Path(checkpoint_files[-1]).expanduser().parent
+    return None
+
+
+def _same_directory(first, second):
+    """Report whether two optional folders name the same place."""
+    if first is None or second is None:
+        return first is None and second is None
+    # Comparing the folders themselves, not their spellings, survives
+    # relative paths and Windows short names such as ``USERNA~1``.
+    try:
+        return os.path.samefile(
+            Path(first).expanduser(), Path(second).expanduser()
+        )
+    except OSError:
+        # A folder that does not exist yet is not the one a state came from.
+        return False
 
 
 def load_checkpoint(path):
@@ -200,6 +245,11 @@ def load_checkpoint(path):
             "populate_first_100": bool(saved["populate_first_100"]),
             "checkpoint_path": str(checkpoint_path.resolve()),
         }
+        if "initial_newest_species" in saved.files:
+            state["initial_newest_species"] = int(
+                saved["initial_newest_species"]
+            )
+    state["initial_newest_species"] = _initial_newest_species(state)
 
     # The patch series lives in the run's analysis record rather than in the
     # snapshot, because most snapshots are deleted once they are counted. A
@@ -341,6 +391,13 @@ def _normalize_initial_state(initial_state):
             )
         patch_history = patch_history.copy()
 
+    if supplied_times is None:
+        initial_newest_species = newest_species
+    else:
+        initial_newest_species = _initial_newest_species(initial_state)
+    if initial_newest_species > newest_species:
+        raise ValueError("initial_newest_species cannot exceed newest_species")
+
     rng_state = initial_state.get("rng_state")
     if isinstance(rng_state, str):
         rng_state = json.loads(rng_state)
@@ -357,7 +414,9 @@ def _normalize_initial_state(initial_state):
         "tracked_timesteps": tracked_timesteps,
         "diversity_history": diversity_history,
         "patch_history": patch_history,
+        "initial_newest_species": initial_newest_species,
         "rng_state": dict(rng_state) if rng_state is not None else None,
+        "source_directory": _state_directory(initial_state),
     }
 
 
@@ -407,6 +466,9 @@ def _write_checkpoint(checkpoint_dir, state):
                 target_timestep=np.int64(state["target_timestep"]),
                 tracked_timesteps=state["tracked_timesteps"],
                 diversity_history=state["diversity_history"],
+                initial_newest_species=np.int64(
+                    _initial_newest_species(state)
+                ),
                 rng_state=np.asarray(json.dumps(state["rng_state"])),
                 gamma=np.float64(state["gamma"]),
                 alpha=np.float64(state["alpha"]),
@@ -603,6 +665,9 @@ def _write_analysis(checkpoint_dir, record):
                 event_timesteps=np.asarray(
                     record["event_timesteps"], dtype=np.int64
                 ),
+                initial_newest_species=np.int64(
+                    _initial_newest_species(record)
+                ),
                 timestep=np.int64(record["timestep"]),
                 target_timestep=np.int64(record["target_timestep"]),
                 gamma=np.float64(record["gamma"]),
@@ -653,6 +718,7 @@ def load_analysis(path):
     record["gamma"] = float(record["gamma"])
     record["alpha"] = float(record["alpha"])
     record["populate_first_100"] = bool(record["populate_first_100"])
+    record["initial_newest_species"] = _initial_newest_species(record)
     record["analysis_path"] = str(analysis_path.resolve())
     return record
 
@@ -1215,6 +1281,7 @@ def _simulate_lattice(
     prior_tracked_timesteps=None,
     prior_diversity_history=None,
     prior_patch_history=None,
+    initial_newest_species=None,
     checkpoint_dir=None,
     retention=None,
     target_timestep=None,
@@ -1258,6 +1325,9 @@ def _simulate_lattice(
     target_timestep = int(target_timestep)
     if target_timestep != int(initial_timestep) + int(T):
         raise ValueError("target_timestep must equal initial timestep plus T")
+    if initial_newest_species is None:
+        initial_newest_species = newest_species
+    initial_newest_species = int(initial_newest_species)
     if checkpoint_dir is not None and T:
         _validate_checkpoint_destination(checkpoint_dir, initial_timestep)
 
@@ -1454,6 +1524,7 @@ def _simulate_lattice(
                             "target_timestep": target_timestep,
                             "tracked_timesteps": tracked_so_far,
                             "diversity_history": diversity_so_far,
+                            "initial_newest_species": initial_newest_species,
                             "rng_state": rng.bit_generator.state,
                             "gamma": float(gamma),
                             "alpha": float(alpha),
@@ -1493,6 +1564,7 @@ def _simulate_lattice(
                             "diversity_history": diversity_so_far,
                             "patch_history": patch_so_far,
                             "event_timesteps": snapshot_retention.events,
+                            "initial_newest_species": initial_newest_species,
                             "timestep": snapshot_timestep,
                             "target_timestep": target_timestep,
                             "gamma": float(gamma),
@@ -1539,6 +1611,7 @@ def _simulate_lattice(
                 "diversity_history": diversity_history,
                 "patch_history": patch_history,
                 "event_timesteps": event_timesteps,
+                "initial_newest_species": initial_newest_species,
                 "timestep": target_timestep,
                 "target_timestep": target_timestep,
                 "gamma": float(gamma),
@@ -1571,6 +1644,7 @@ def _simulate_lattice(
             "tracked_timesteps": tracked_timesteps,
             "diversity_history": diversity_history,
             "patch_history": patch_history,
+            "initial_newest_species": initial_newest_species,
             "event_timesteps": event_timesteps,
             "rng_state": rng.bit_generator.state,
             "checkpoint_files": checkpoint_files,
@@ -1593,6 +1667,7 @@ def simulation_from_state(
     checkpoint_dir=None,
     retention=None,
     target_timestep=None,
+    continue_history=None,
 ):
     """Run ``T`` additional time units from a result or saved checkpoint.
 
@@ -1601,12 +1676,30 @@ def simulation_from_state(
     A saved RNG is restored automatically; ``seed`` is used for raw states
     that do not contain one. When raw arrays omit ``current_species``, Gamma
     rows are assumed to follow the ascending positive IDs in the lattice.
+
+    ``continue_history`` decides whether the state's recorded history is
+    carried into this leg. By default it is carried only when the leg writes
+    to the folder the state came from, which is an extension of that run. A
+    leg written anywhere else is a branch: its history, analysis record and
+    species-introduced count start at the state's timestep, which keeps its
+    original simulation time.
     """
     _validate_simulation_options(
         alpha, T, track_every, progress, populate_first_100
     )
     _validate_gamma(gamma)
     state = _normalize_initial_state(initial_state)
+    if continue_history is None:
+        continue_history = _same_directory(
+            state["source_directory"], checkpoint_dir
+        )
+    elif not isinstance(continue_history, (bool, np.bool_)):
+        raise TypeError("continue_history must be True, False, or None")
+    if not continue_history:
+        # The branch keeps only the sample it starts from.
+        for key in ("tracked_timesteps", "diversity_history", "patch_history"):
+            state[key] = state[key][-1:].copy()
+        state["initial_newest_species"] = state["newest_species"]
     rng = _make_rng(seed, state["rng_state"])
     if target_timestep is None:
         target_timestep = state["timestep"] + int(T)
@@ -1626,6 +1719,7 @@ def simulation_from_state(
         prior_tracked_timesteps=state["tracked_timesteps"],
         prior_diversity_history=state["diversity_history"],
         prior_patch_history=state["patch_history"],
+        initial_newest_species=state["initial_newest_species"],
         checkpoint_dir=checkpoint_dir,
         retention=retention,
         target_timestep=target_timestep,
@@ -1646,6 +1740,7 @@ def main_simulation(
     initial_state=None,
     checkpoint_dir=None,
     retention=None,
+    continue_history=None,
 ):
     """Run the spatial invasion simulation.
 
@@ -1665,7 +1760,8 @@ def main_simulation(
     sample is still recorded.
     Set ``checkpoint_dir`` to save one state at every tracking interval. Pass
     a previous result, checkpoint dictionary, or checkpoint path as
-    ``initial_state`` to run ``T`` additional time units from that state.
+    ``initial_state`` to run ``T`` additional time units from that state; see
+    ``simulation_from_state`` for when its history is carried over.
     """
     _validate_simulation_options(
         alpha, T, track_every, progress, populate_first_100
@@ -1683,6 +1779,7 @@ def main_simulation(
             populate_first_100=populate_first_100,
             checkpoint_dir=checkpoint_dir,
             retention=retention,
+            continue_history=continue_history,
         )
 
     rng = _make_rng(seed)
@@ -1720,6 +1817,7 @@ def percolation_simulation(
     initial_state=None,
     checkpoint_dir=None,
     retention=None,
+    continue_history=None,
 ):
     """Run the simulation with permanent random site removal.
 
@@ -1755,6 +1853,7 @@ def percolation_simulation(
             populate_first_100=populate_first_100,
             checkpoint_dir=checkpoint_dir,
             retention=retention,
+            continue_history=continue_history,
         )
         result["p"] = float(p)
         result["p_applied"] = False
@@ -2232,12 +2331,28 @@ def _gaussian_smooth(values, sigma, truncate=4.0):
     return np.convolve(padded, kernel, mode="valid")
 
 
+def _series_from(timesteps, values, start_timestep, name):
+    """Keep the samples of a time series at or after ``start_timestep``."""
+    timesteps = np.asarray(timesteps)
+    values = np.asarray(values)
+    if start_timestep is None:
+        return timesteps, values
+    shown = timesteps >= start_timestep
+    if not np.any(shown):
+        raise ValueError(
+            f"no {name} samples at or after start_timestep "
+            f"{start_timestep:,.0f}"
+        )
+    return timesteps[shown], values[shown]
+
+
 def show_results(
     results,
     show_patchiness=False,
     checkpoint_dir=None,
     lattice_timestep=None,
     smooth_sigma=None,
+    start_timestep=None,
 ):
     """Plot a lattice snapshot and the full diversity/patchiness history.
 
@@ -2246,18 +2361,32 @@ def show_results(
     y-axis. ``checkpoint_dir`` can explicitly name a checkpoint directory or
     file; otherwise checkpoint metadata in ``results`` is used. When
     ``lattice_timestep`` is supplied, the lattice nearest to that simulation
-    time is loaded from the available checkpoints. The time-series plots are
-    still drawn through the full result time.
+    time is loaded from the available checkpoints.
+
+    ``start_timestep`` drops the time-series samples before that simulation
+    time, for example the history a branch inherited from the run it was
+    started from. The curves still end at the result time, and the lattice
+    shown is unaffected.
 
     ``smooth_sigma`` draws a Gaussian-smoothed living-species curve, and a
     smoothed patchiness curve when one is shown, over a faded copy of the
     raw series. The width is given in tracked samples rather than timesteps,
     so a run tracked every ``track_every`` steps is smoothed over roughly
-    ``smooth_sigma * track_every`` simulation time.
+    ``smooth_sigma * track_every`` simulation time. Smoothing is applied
+    after ``start_timestep`` is, so earlier samples do not bleed into it.
     """
     if not isinstance(show_patchiness, (bool, np.bool_)):
         raise TypeError("show_patchiness must be True or False")
     smooth_sigma = _validate_smoothing_sigma(smooth_sigma)
+    start_timestep = _validate_animation_timestep(
+        start_timestep, "start_timestep"
+    )
+    diversity_timesteps, diversity_history = _series_from(
+        results["tracked_timesteps"],
+        results["diversity_history"],
+        start_timestep,
+        "living-species",
+    )
 
     lattice = results["lattice"]
     selected_timestep = None
@@ -2273,8 +2402,10 @@ def show_results(
 
     patchiness_history = None
     if show_patchiness:
-        patchiness_history = _load_patchiness_history(
-            results, checkpoint_dir=checkpoint_dir
+        patchiness_history = _series_from(
+            *_load_patchiness_history(results, checkpoint_dir=checkpoint_dir),
+            start_timestep,
+            "patchiness",
         )
 
     # Compact historical IDs so every currently living species gets a color.
@@ -2305,8 +2436,6 @@ def show_results(
     )
     ax_lattice.set_axis_off()
 
-    diversity_timesteps = results["tracked_timesteps"]
-    diversity_history = results["diversity_history"]
     if smooth_sigma is None:
         diversity_line, = ax_diversity.plot(
             diversity_timesteps,
@@ -2379,7 +2508,7 @@ def show_results(
     plt.tight_layout()
     plt.show()
 
-    initial_species = int(results["diversity_history"][0])
+    initial_newest_species = _initial_newest_species(results)
     if selected_timestep is None:
         print(f"Living species:        {results['diversity']:,}")
         print(f"Largest species ID:    {results['newest_species']:,}")
@@ -2388,7 +2517,10 @@ def show_results(
         print(f"Displayed species:     {number_of_species:,}")
         print(f"Final living species:  {results['diversity']:,}")
         print(f"Final largest ID:      {results['newest_species']:,}")
-    print(f"Species introduced:    {results['newest_species'] - initial_species:,}")
+    print(
+        "Species introduced:    "
+        f"{results['newest_species'] - initial_newest_species:,}"
+    )
 
 
 def _validate_animation_timestep(value, name):

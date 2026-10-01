@@ -270,5 +270,136 @@ class RunIntegrationTests(unittest.TestCase):
         )
 
 
+class BranchHistoryTests(unittest.TestCase):
+    """A branch starts its own history; an in-place extension keeps it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(tempfile.mkdtemp())
+        cls.base_directory = cls.root / "base"
+        cls.config = MS.SimulationConfig(
+            L_col=20,
+            L_row=20,
+            D=1,
+            gamma=0.5,
+            alpha=2.0,
+            T=2000,
+            track_every=50,
+            seed=7,
+            populate_first_100=True,
+            checkpoint_dir=str(cls.base_directory),
+            retention=MS.RetentionPolicy(event_window=200, smooth_samples=3),
+        )
+        cls.base = cls.config.run_main()
+
+        cls.config.gamma = 0.3
+        cls.config.T = 1000
+        cls.branch_directory = cls.root / "branch"
+        cls.config.checkpoint_dir = str(cls.branch_directory)
+        cls.branch = cls.config.run_main(
+            initial_state=str(cls.base_directory)
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.root, ignore_errors=True)
+
+    def test_branch_history_starts_at_the_initial_state(self):
+        times = self.branch["tracked_timesteps"]
+        self.assertEqual(times[0], 2000)
+        self.assertEqual(times[-1], 3000)
+        self.assertEqual(times.size, 1000 // 50 + 1)
+        self.assertEqual(
+            self.branch["diversity_history"][0], self.base["diversity"]
+        )
+        self.assertEqual(self.branch["patch_history"].size, times.size)
+        self.assertFalse(np.any(self.branch["patch_history"] < 0))
+
+    def test_branch_analysis_and_checkpoints_hold_only_the_branch(self):
+        record = MS.load_analysis(self.branch_directory)
+        np.testing.assert_array_equal(
+            record["tracked_timesteps"], self.branch["tracked_timesteps"]
+        )
+        state = MS.load_checkpoint(self.branch_directory)
+        self.assertEqual(state["tracked_timesteps"][0], 2000)
+        self.assertEqual(
+            state["patch_history"].size, state["tracked_timesteps"].size
+        )
+
+    def test_branch_counts_only_its_own_introductions(self):
+        base_newest = self.base["newest_species"]
+        self.assertEqual(self.branch["initial_newest_species"], base_newest)
+        state = MS.load_checkpoint(self.branch_directory)
+        self.assertEqual(state["initial_newest_species"], base_newest)
+        self.assertEqual(
+            MS.load_analysis(self.branch_directory)["initial_newest_species"],
+            base_newest,
+        )
+
+    def test_extension_in_the_same_folder_keeps_the_history(self):
+        directory = self.root / "extended"
+        shutil.copytree(self.base_directory, directory)
+        extended = MS.main_simulation(
+            L_col=20, L_row=20, D=1, gamma=0.5, alpha=2.0, T=500,
+            track_every=50,
+            initial_state=str(directory),
+            checkpoint_dir=str(directory),
+        )
+        times = extended["tracked_timesteps"]
+        self.assertEqual(times[0], 0)
+        self.assertEqual(times.size, self.base["tracked_timesteps"].size + 10)
+        self.assertEqual(extended["initial_newest_species"], 1)
+        np.testing.assert_array_equal(
+            MS.load_analysis(directory)["tracked_timesteps"], times
+        )
+
+    def test_history_can_be_carried_into_a_new_folder_explicitly(self):
+        carried = MS.main_simulation(
+            L_col=20, L_row=20, D=1, gamma=0.5, alpha=2.0, T=100,
+            track_every=50,
+            initial_state=str(self.base_directory),
+            checkpoint_dir=str(self.root / "carried"),
+            continue_history=True,
+        )
+        self.assertEqual(carried["tracked_timesteps"][0], 0)
+        self.assertEqual(carried["initial_newest_species"], 1)
+
+    def test_in_memory_result_without_checkpoints_keeps_the_history(self):
+        first = MS.main_simulation(
+            L_col=10, L_row=10, D=1, gamma=0.5, alpha=2.0, T=100,
+            track_every=50, seed=3,
+        )
+        second = MS.main_simulation(
+            L_col=10, L_row=10, D=1, gamma=0.5, alpha=2.0, T=100,
+            track_every=50, initial_state=first,
+        )
+        np.testing.assert_array_equal(
+            second["tracked_timesteps"], [0, 50, 100, 150, 200]
+        )
+
+    def test_resuming_a_branch_keeps_the_branch_history(self):
+        # Resume from a snapshot before the branch's end, into a new folder
+        # so the branch's later snapshots do not block the write.
+        snapshots = sorted(self.branch_directory.glob("checkpoint_*.npz"))
+        middle = next(
+            path for path in snapshots
+            if MS._checkpoint_timestep(path) < 3000
+        )
+        self.config.checkpoint_dir = str(self.root / "resumed")
+        resumed = self.config.resume(middle)
+        self.assertEqual(resumed["tracked_timesteps"][0], 2000)
+        self.assertEqual(resumed["timestep"], 3000)
+        self.assertEqual(
+            resumed["initial_newest_species"], self.base["newest_species"]
+        )
+
+    def test_continue_history_must_be_a_boolean(self):
+        with self.assertRaisesRegex(TypeError, "continue_history"):
+            MS.simulation_from_state(
+                str(self.base_directory), gamma=0.5, alpha=2.0, T=0,
+                continue_history="yes",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
