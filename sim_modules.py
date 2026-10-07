@@ -1,9 +1,14 @@
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from contextlib import contextmanager
+from copy import deepcopy
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+import hashlib
 import json
 import math
+import multiprocessing
 import os
+import signal
 from pathlib import Path
 import tempfile
 from matplotlib.colors import BoundaryNorm, ListedColormap
@@ -57,6 +62,8 @@ class SimulationConfig:
     # the newest state, plus one window either side of each detected swap in
     # living species. Pass RetentionPolicy(keep_all=True) to keep every one.
     retention: "RetentionPolicy | None" = None
+    # Keep only the largest periodic four-neighbour usable component at start.
+    largest_cluster_only: bool = True
 
     def run_main(self, initial_state=None, continue_history=None):
         """Run the ordinary simulation using the current settings."""
@@ -95,6 +102,18 @@ class SimulationConfig:
             checkpoint_dir=self.checkpoint_dir,
             retention=self.retention,
             continue_history=continue_history,
+            largest_cluster_only=self.largest_cluster_only,
+        )
+
+    def run_many(
+        self, repeats=1, *, kind="main", base_seed=None, max_workers=None,
+        checkpoint_root=None, initial_state=None,
+    ):
+        """Run independent repetitions; see :func:`run_simulations`."""
+        return run_simulations(
+            self, kind=kind, repeats=repeats, base_seed=base_seed,
+            max_workers=max_workers, checkpoint_root=checkpoint_root,
+            initial_state=initial_state,
         )
 
     def resume(self, checkpoint=None):
@@ -132,7 +151,667 @@ class SimulationConfig:
         )
 
 
+_BATCH_INITIAL_STATE = None
+
+
+def _batch_settings_instance(value, settings_class):
+    """Recognize settings retained by a notebook across reload(sim_modules)."""
+    return isinstance(value, settings_class) or (
+        is_dataclass(value)
+        and type(value).__module__ == settings_class.__module__
+        and type(value).__qualname__ == settings_class.__qualname__
+    )
+
+
+def _copy_batch_settings(value, settings_class):
+    # Spawn workers must receive instances of the currently imported classes.
+    return settings_class(**{
+        field.name: getattr(value, field.name) for field in fields(settings_class)
+        if hasattr(value, field.name)
+    })
+
+
+def _batch_integer(value, name, *, minimum=0):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise TypeError(f"{name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return int(value)
+
+
+def _batch_json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    raise TypeError(f"cannot record batch setting {type(value).__name__}")
+
+
+def _validate_batch_config(config, kind, initial_state):
+    """Reject configuration errors before any potentially long job starts."""
+    _validate_simulation_options(
+        config.alpha, config.T, config.track_every, config.progress,
+        config.populate_first_100,
+    )
+    _validate_gamma(config.gamma)
+    if config.retention is not None and not isinstance(
+        config.retention, RetentionPolicy
+    ):
+        raise TypeError("retention must be a RetentionPolicy or None")
+    if kind == "percolation":
+        if not isinstance(config.largest_cluster_only, (bool, np.bool_)):
+            raise TypeError("largest_cluster_only must be a boolean")
+        if isinstance(config.p, (bool, np.bool_)) or not isinstance(
+            config.p, (int, float, np.integer, np.floating)
+        ):
+            raise TypeError("p must be a real number")
+        if not 0 <= config.p <= 1:
+            raise ValueError("p must be between 0 and 1")
+    if initial_state is None:
+        columns = _batch_integer(config.L_col, "L_col", minimum=1)
+        rows = _batch_integer(config.L_row, "L_row", minimum=1)
+        diversity = _batch_integer(
+            config.D, "D", minimum=1 if kind == "main" else 0
+        )
+        sites = rows * columns
+        if diversity > sites:
+            raise ValueError("D cannot exceed the number of lattice sites")
+        usable_sites = sites if kind == "main" else None
+    else:
+        sites = initial_state["lattice"].size
+        usable_sites = np.count_nonzero(initial_state["lattice"] != -1)
+    if usable_sites and config.alpha * config.gamma / sites > 1:
+        raise ValueError("alpha * gamma / N cannot exceed 1")
+
+
+def _validate_batch_percolation_start(config):
+    """Replay only site removal to check its seed-dependent initial capacity."""
+    sites = int(config.L_col) * int(config.L_row)
+    if config.p == 0:
+        usable = sites
+    elif config.p == 1:
+        usable = 0
+    elif config.largest_cluster_only:
+        rng = np.random.default_rng(config.seed)
+        mask = (rng.random(sites) >= config.p).reshape(
+            int(config.L_row), int(config.L_col)
+        )
+        usable = np.count_nonzero(_largest_usable_cluster_mask(mask))
+    else:
+        rng = np.random.default_rng(config.seed)
+        usable = 0
+        # Avoid allocating another complete lattice for this early check.
+        for start in range(0, sites, 1_000_000):
+            usable += np.count_nonzero(
+                rng.random(min(1_000_000, sites - start)) >= config.p
+            )
+    if usable and config.D == 0:
+        raise ValueError("D must be positive when usable sites remain")
+    if config.D > usable:
+        raise ValueError(f"D={config.D} exceeds the {usable} usable sites")
+    if usable and config.alpha * config.gamma / sites > 1:
+        raise ValueError("alpha * gamma / N cannot exceed 1")
+
+
+def _initialize_simulation_worker(initial_state):
+    # Send a potentially large branching state once per process, not per job.
+    global _BATCH_INITIAL_STATE
+    _BATCH_INITIAL_STATE = initial_state
+    # Let the parent handle Ctrl+C and terminate workers. Atomic replacement
+    # protects completed snapshots even if a temporary-file write is stopped.
+    # Children receiving the same console signal would otherwise each raise
+    # KeyboardInterrupt independently.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+@contextmanager
+def _simulation_directory_lock(directory, filename=".job.lock"):
+    """Hold a crash-released advisory lock for a saved simulation directory."""
+    directory = Path(directory).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_path = directory / filename
+    with lock_path.open("a+b") as lock_file:
+        if lock_file.seek(0, os.SEEK_END) == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise RuntimeError(
+                f"simulation directory is already in use: {directory}; "
+                "stop its running process before resuming"
+            ) from error
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _simulation_job_lock(config):
+    if config.checkpoint_dir is None:
+        yield
+    else:
+        with _simulation_directory_lock(config.checkpoint_dir):
+            yield
+
+
+def _execute_simulation_job(job, initial_state):
+    config, metadata = job
+    try:
+        run = config.run_main if metadata["kind"] == "main" else config.run_percolation
+        with _simulation_job_lock(config):
+            result = run(initial_state=initial_state, continue_history=False)
+    except Exception as error:
+        raise RuntimeError(
+            f"simulation job {metadata['job_index']} "
+            f"(config {metadata['config_index']}, repeat {metadata['repeat_index']}, "
+            f"seed={config.seed}, checkpoint_dir={config.checkpoint_dir!r}) "
+            f"failed: {error}"
+        ) from error
+    result["batch_metadata"] = {**metadata, "worker_pid": os.getpid()}
+    return result
+
+
+def _process_simulation_job(job):
+    """Importable entry point required by spawned Windows/notebook workers."""
+    return _execute_simulation_job(job, _BATCH_INITIAL_STATE)
+
+
+def _branch_state_fingerprint(state):
+    """Identify the model state used by an independent branch, excluding RNG."""
+    digest = hashlib.sha256()
+    for key in ("lattice", "Gamma", "current_species"):
+        values = np.ascontiguousarray(state[key], dtype="<i8")
+        digest.update(key.encode("ascii"))
+        digest.update(np.asarray(values.shape, dtype="<i8").tobytes())
+        digest.update(values.tobytes())
+    digest.update(json.dumps({
+        "timestep": int(state["timestep"]),
+        "newest_species": int(state["newest_species"]),
+    }, sort_keys=True).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _stop_simulation_executor(executor):
+    """Stop spawned workers before returning from an interrupted saved batch.
+
+    Python 3.12's shutdown(cancel_futures=True) cancels only queued jobs. Its
+    active processes must also be stopped, otherwise Ctrl+C leaves them writing
+    to the same checkpoint folders that a subsequent resume will use.
+    """
+    processes = list((getattr(executor, "_processes", None) or {}).values())
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    executor.shutdown(wait=False, cancel_futures=True)
+    for process in processes:
+        process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+
+
+def run_simulations(
+    configs, *, kind="main", repeats=1, base_seed=None, max_workers=None,
+    checkpoint_root=None, initial_state=None,
+):
+    """Run independent simulations on separate CPU processes.
+
+    ``configs`` is a SimulationConfig or an iterable of them. Jobs are returned
+    in configuration order, with ``repeats`` independent runs of each. Settings
+    are copied before submission, including the mutable retention policy.
+    ``max_workers=None`` uses the available CPU count, capped by the job count;
+    set it lower to limit memory use, or to 1 to replay without subprocesses.
+
+    Each job uses its own reproducible SeedSequence child seed. ``base_seed``
+    overrides configuration seeds; otherwise each distinct configuration seed
+    supplies a root, and configurations with the same seed share that root's
+    child sequence. Unseeded configurations share a fresh entropy root. The
+    actual seeds and settings are returned in each result's ``batch_metadata``.
+    Repeating the same seeded batch reproduces it regardless of worker count;
+    use a different base seed for another independent batch.
+
+    ``checkpoint_root`` stores a batch_plan.json before execution and gives
+    every job its own subfolder. Without it, each config's ``checkpoint_dir``
+    serves as that config's parent folder. Existing job folders and batch plans
+    are rejected before execution; use a new root for a new saved batch.
+
+    ``initial_state`` deliberately creates independent branches: its saved RNG
+    is replaced by each job's child stream, and history starts at the branch
+    timestep. Single-run run_main/run_percolation/resume retain their usual
+    exact continuation behavior. All branches share the same starting lattice.
+
+    Workers import this module, so calls work from notebooks on Windows. In a
+    Python script, put the call under ``if __name__ == '__main__':``. On failure
+    or interruption, running workers are stopped and pending jobs are cancelled.
+    """
+    if kind not in ("main", "percolation"):
+        raise ValueError("kind must be 'main' or 'percolation'")
+    repeats = _batch_integer(repeats, "repeats", minimum=1)
+    if base_seed is not None:
+        base_seed = _batch_integer(base_seed, "base_seed")
+    if max_workers is not None:
+        max_workers = _batch_integer(max_workers, "max_workers", minimum=1)
+        if os.name == "nt" and max_workers > 61:
+            raise ValueError("max_workers cannot exceed 61 on Windows")
+    if _batch_settings_instance(configs, SimulationConfig):
+        configs = [configs]
+    else:
+        configs = list(configs)
+    if not configs:
+        raise ValueError("configs must contain at least one SimulationConfig")
+    if any(not _batch_settings_instance(config, SimulationConfig) for config in configs):
+        raise TypeError("configs must contain only SimulationConfig instances")
+    configs = [_copy_batch_settings(config, SimulationConfig) for config in configs]
+    for config in configs:
+        if _batch_settings_instance(config.retention, RetentionPolicy):
+            config.retention = _copy_batch_settings(config.retention, RetentionPolicy)
+    state = None
+    if initial_state is not None:
+        state = _normalize_initial_state(initial_state)
+        state["rng_state"] = None
+    for index, config in enumerate(configs):
+        try:
+            _validate_batch_config(config, kind, state)
+            if config.seed is not None:
+                _batch_integer(config.seed, f"configs[{index}].seed")
+        except (TypeError, ValueError) as error:
+            raise type(error)(f"config {index}: {error}") from error
+    cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+    if max_workers is None and hasattr(os, "sched_getaffinity"):
+        cpu_count = len(os.sched_getaffinity(0)) or 1
+    if os.name == "nt":
+        cpu_count = min(cpu_count, 61)
+    max_workers = min(max_workers or cpu_count, len(configs) * repeats)
+    root = Path(checkpoint_root).expanduser().resolve() if checkpoint_root is not None else None
+    plan_path = root / "batch_plan.json" if root is not None else None
+    if plan_path is not None and plan_path.exists():
+        raise FileExistsError(f"batch plan already exists: {plan_path}; use a new checkpoint_root")
+    seed_roots = {}
+    used_seeds = set()
+    jobs = []
+    directories = []
+    for config_index, config in enumerate(configs):
+        root_seed = base_seed if base_seed is not None else config.seed
+        root_seed = int(root_seed) if root_seed is not None else None
+        if root_seed not in seed_roots:
+            seed_roots[root_seed] = np.random.SeedSequence(root_seed)
+        sequence = seed_roots[root_seed]
+        for repeat_index in range(repeats):
+            child = sequence.spawn(1)[0]
+            seed = int.from_bytes(child.generate_state(4).astype("<u4").tobytes(), "little")
+            while seed in used_seeds:
+                child = sequence.spawn(1)[0]
+                seed = int.from_bytes(child.generate_state(4).astype("<u4").tobytes(), "little")
+            used_seeds.add(seed)
+            job_index = len(jobs)
+            parent = root if root is not None else config.checkpoint_dir
+            directory = None if parent is None else (
+                Path(parent).expanduser().resolve() / f"job_{job_index:05d}_seed_{seed}"
+            )
+            job_config = replace(config, seed=seed,
+                                 checkpoint_dir=str(directory) if directory is not None else None)
+            if kind == "percolation" and state is None:
+                try:
+                    _validate_batch_percolation_start(job_config)
+                except ValueError as error:
+                    raise ValueError(f"job {job_index}, seed={seed}: {error}") from error
+            metadata = {
+                "job_index": job_index, "config_index": config_index,
+                "repeat_index": repeat_index, "kind": kind, "seed": seed,
+                "seed_root": int(sequence.entropy), "seed_spawn_key": list(child.spawn_key),
+                "max_workers": max_workers, "checkpoint_dir": job_config.checkpoint_dir,
+                "plan_path": str(plan_path) if plan_path is not None else None,
+                "forked_rng": state is not None,
+                "config": json.loads(json.dumps(asdict(job_config), default=_batch_json_default)),
+            }
+            jobs.append((job_config, metadata))
+            if directory is not None:
+                if directory.exists():
+                    raise FileExistsError(f"job {job_index} checkpoint directory already exists: {directory}")
+                for previous in directories:
+                    if directory == previous or directory.is_relative_to(previous) or previous.is_relative_to(directory):
+                        raise ValueError(f"batch checkpoint directories overlap: {previous} and {directory}")
+                ancestor = directory.parent
+                while not ancestor.exists():
+                    ancestor = ancestor.parent
+                if not ancestor.is_dir():
+                    raise NotADirectoryError(f"checkpoint parent is not a directory: {ancestor}")
+                directories.append(directory)
+    # Reserve every destination and record the seeds before any worker starts.
+    if root is not None:
+        root.mkdir(parents=True, exist_ok=True)
+        with plan_path.open("x", encoding="utf-8") as plan_file:
+            json.dump({
+                "format_version": 1, "kind": kind, "repeats": repeats,
+                "base_seed": base_seed, "max_workers": max_workers,
+                "initial_state": None if state is None else {
+                    "timestep": int(state["timestep"]),
+                    "lattice_shape": list(state["lattice"].shape),
+                    "source_directory": state["source_directory"],
+                    "state_fingerprint": _branch_state_fingerprint(state),
+                    "forked_rng": True,
+                },
+                "jobs": [metadata for _, metadata in jobs],
+            }, plan_file, indent=2, default=_batch_json_default)
+            plan_file.write("\n")
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=False)
+    if max_workers == 1:
+        return [_execute_simulation_job(job, state) for job in jobs]
+    executor = ProcessPoolExecutor(
+        max_workers=max_workers, mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_simulation_worker, initargs=(state,),
+    )
+    futures = {}
+    results = [None] * len(jobs)
+    try:
+        for index, job in enumerate(jobs):
+            try:
+                futures[executor.submit(_process_simulation_job, job)] = index
+            except Exception as error:
+                metadata = job[1]
+                raise RuntimeError(
+                    f"cannot submit simulation job {index}, seed={metadata['seed']}, "
+                    f"checkpoint_dir={metadata['checkpoint_dir']!r}: {error}"
+                ) from error
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as error:
+                metadata = jobs[index][1]
+                raise RuntimeError(
+                    f"simulation job {index}, seed={metadata['seed']}, "
+                    f"checkpoint_dir={metadata['checkpoint_dir']!r} failed: {error}"
+                ) from error
+    except BaseException:
+        _stop_simulation_executor(executor)
+        raise
+    executor.shutdown(wait=True)
+    return results
+
+
+def _execute_resumed_simulation_job(job, initial_state):
+    config, metadata, state, resume_metadata = job
+    if state is None:
+        result = _execute_simulation_job((config, metadata), initial_state)
+    else:
+        try:
+            with _simulation_job_lock(config):
+                result = simulation_from_state(
+                    state, gamma=config.gamma, alpha=config.alpha,
+                    T=resume_metadata["remaining_timesteps"],
+                    track_every=config.track_every, seed=config.seed,
+                    progress=config.progress,
+                    populate_first_100=config.populate_first_100,
+                    checkpoint_dir=config.checkpoint_dir,
+                    retention=config.retention,
+                    target_timestep=int(state["target_timestep"]),
+                    continue_history=True,
+                )
+        except Exception as error:
+            raise RuntimeError(
+                f"cannot resume simulation job {metadata['job_index']}, "
+                f"seed={config.seed}, checkpoint_dir={config.checkpoint_dir!r}: "
+                f"{error}"
+            ) from error
+    result["resume_metadata"] = dict(resume_metadata)
+    result["batch_metadata"] = {
+        **metadata, **resume_metadata, "worker_pid": os.getpid(),
+    }
+    return result
+
+
+def _process_resumed_simulation_job(job):
+    return _execute_resumed_simulation_job(job, _BATCH_INITIAL_STATE)
+
+
+def resume_simulations(checkpoint_root, *, max_workers=None, initial_state=None):
+    """Resume a saved batch without changing its jobs, seeds or histories.
+
+    Read the existing ``batch_plan.json`` and continue unfinished jobs from
+    their newest atomic checkpoint, including its exact saved random state.
+    Finished jobs are loaded without rewriting any of their files. A job that
+    has not yet saved a checkpoint restarts using its original child seed.
+    For such jobs in a branched batch, pass the original shared starting state
+    as ``initial_state``. New batch plans fingerprint that state to detect an
+    accidental change. No new seeds or checkpoint folders are generated.
+
+    Validate every job and checkpoint before running any work. A corrupt newest
+    checkpoint raises an error naming that file; it is never silently replaced
+    with a new simulation. Results retain the original order and batch metadata,
+    with ``resume_metadata`` describing resumed and already completed jobs.
+    Spawned workers are stopped on interruption so the same batch can safely be
+    resumed after this call exits. Do not resume while another process is still
+    running the batch.
+    """
+    if max_workers is not None:
+        max_workers = _batch_integer(max_workers, "max_workers", minimum=1)
+        if os.name == "nt" and max_workers > 61:
+            raise ValueError("max_workers cannot exceed 61 on Windows")
+    root = Path(checkpoint_root).expanduser().resolve()
+    plan_path = root / "batch_plan.json"
+    with plan_path.open("r", encoding="utf-8") as plan_file:
+        plan = json.load(plan_file)
+    if not isinstance(plan, Mapping) or plan.get("format_version") != 1:
+        raise ValueError("unsupported or invalid batch_plan.json format")
+    kind = plan.get("kind")
+    if kind not in ("main", "percolation"):
+        raise ValueError("batch plan kind must be 'main' or 'percolation'")
+    saved_jobs = plan.get("jobs")
+    if not isinstance(saved_jobs, list) or not saved_jobs:
+        raise ValueError("batch plan must contain at least one job")
+    branch = plan.get("initial_state")
+    if branch is not None and not isinstance(branch, Mapping):
+        raise ValueError("batch plan initial_state must be a mapping or null")
+    start_timestep = 0 if branch is None else _batch_integer(
+        branch.get("timestep"), "initial_state.timestep"
+    )
+    source_state = None
+    if initial_state is not None:
+        if branch is None:
+            raise ValueError("this batch started fresh; do not pass initial_state")
+        source_state = _normalize_initial_state(initial_state)
+        expected_shape = tuple(branch.get("lattice_shape", ()))
+        if source_state["timestep"] != start_timestep or (
+            source_state["lattice"].shape != expected_shape
+        ):
+            raise ValueError("initial_state does not match the batch's starting timestep/lattice shape")
+        fingerprint = branch.get("state_fingerprint")
+        if fingerprint is not None and _branch_state_fingerprint(source_state) != fingerprint:
+            raise ValueError("initial_state fingerprint does not match the original batch starting state")
+        source_state["rng_state"] = None
+
+    results = [None] * len(saved_jobs)
+    pending = []
+    used_seeds = set()
+    for index, saved_metadata in enumerate(saved_jobs):
+        try:
+            if not isinstance(saved_metadata, Mapping):
+                raise ValueError("job metadata must be a mapping")
+            metadata = deepcopy(dict(saved_metadata))
+            if _batch_integer(metadata.get("job_index"), "job_index") != index:
+                raise ValueError("job_index must match its position in the plan")
+            _batch_integer(metadata.get("config_index"), "config_index")
+            _batch_integer(metadata.get("repeat_index"), "repeat_index")
+            if metadata.get("kind") != kind:
+                raise ValueError("job kind does not match the batch")
+            if metadata.get("forked_rng") != (branch is not None):
+                raise ValueError("job forked_rng does not match the batch")
+            seed = _batch_integer(metadata.get("seed"), "seed")
+            if seed in used_seeds:
+                raise ValueError("batch contains duplicate job seeds")
+            used_seeds.add(seed)
+            if "seed_root" in metadata and "seed_spawn_key" in metadata:
+                seed_root = _batch_integer(metadata["seed_root"], "seed_root")
+                spawn_key = tuple(_batch_integer(value, "seed_spawn_key")
+                                  for value in metadata["seed_spawn_key"])
+                sequence = np.random.SeedSequence(seed_root, spawn_key=spawn_key)
+                expected_seed = int.from_bytes(
+                    sequence.generate_state(4).astype("<u4").tobytes(), "little"
+                )
+                if seed != expected_seed:
+                    raise ValueError("saved seed does not match its SeedSequence child")
+            settings = deepcopy(metadata.get("config"))
+            if not isinstance(settings, dict):
+                raise ValueError("job config must be a mapping")
+            if settings.get("retention") is not None:
+                if not isinstance(settings["retention"], Mapping):
+                    raise ValueError("saved retention must be a mapping or null")
+                settings["retention"] = RetentionPolicy(**settings["retention"])
+            config = SimulationConfig(**settings)
+            _batch_integer(config.seed, "config.seed")
+            if config.seed != seed or isinstance(config.seed, bool):
+                raise ValueError("config seed does not match job seed")
+            directory = root / f"job_{index:05d}_seed_{seed}"
+            for location in (config.checkpoint_dir, metadata.get("checkpoint_dir")):
+                if location is None or Path(location).expanduser().resolve() != directory:
+                    raise ValueError("checkpoint directory does not match the batch job")
+            saved_plan_path = metadata.get("plan_path")
+            if saved_plan_path is None or Path(saved_plan_path).expanduser().resolve() != plan_path:
+                raise ValueError("job plan_path does not match batch_plan.json")
+            if directory.exists() and not directory.is_dir():
+                raise NotADirectoryError(f"checkpoint folder is not a directory: {directory}")
+            # Probe existing locks during preflight, including locks held by
+            # orphaned workers after their parent was forcibly stopped. Do not
+            # create new files in older, already completed job folders.
+            if (directory / ".job.lock").exists():
+                with _simulation_directory_lock(directory):
+                    pass
+            target_timestep = start_timestep + _batch_integer(config.T, "T")
+            candidates = sorted(directory.glob("checkpoint_*.npz"),
+                                key=_checkpoint_timestep) if directory.is_dir() else []
+            state = None
+            checkpoint_path = None
+            if candidates:
+                checkpoint_path = candidates[-1]
+                try:
+                    state = load_checkpoint(checkpoint_path)
+                    _normalize_initial_state(state)
+                    if state["rng_state"] is None:
+                        raise ValueError("checkpoint is missing its saved RNG state")
+                    _make_rng(None, state["rng_state"])
+                except Exception as error:
+                    raise ValueError(f"invalid latest checkpoint {checkpoint_path}: {error}") from error
+                if state["timestep"] != _checkpoint_timestep(checkpoint_path):
+                    raise ValueError("checkpoint timestep does not match its filename")
+                if not start_timestep <= state["timestep"] <= target_timestep:
+                    raise ValueError("checkpoint timestep is outside the saved job interval")
+                if state["target_timestep"] != target_timestep:
+                    raise ValueError("checkpoint target_timestep does not match the saved job")
+                if int(state["tracked_timesteps"][0]) != start_timestep:
+                    raise ValueError("checkpoint history does not start at the batch starting timestep")
+                for key in ("gamma", "alpha", "track_every", "populate_first_100"):
+                    if state[key] != getattr(config, key):
+                        raise ValueError(f"checkpoint {key} does not match the saved job")
+                if kind == "percolation":
+                    for key in ("p", "largest_cluster_only"):
+                        if key in state and state[key] != getattr(config, key):
+                            raise ValueError(f"checkpoint {key} does not match the saved job")
+                expected_shape = (config.L_row, config.L_col) if branch is None else tuple(
+                    branch.get("lattice_shape", ())
+                )
+                if state["lattice"].shape != expected_shape:
+                    raise ValueError("checkpoint lattice shape does not match the saved job")
+                validation_state = _normalize_initial_state(state)
+            else:
+                if (directory / _ANALYSIS_FILENAME).exists():
+                    raise ValueError("analysis exists but no checkpoint remains; refusing to restart this job")
+                if branch is not None and source_state is None:
+                    raise ValueError("initial_state is required to restart a never-started branch")
+                validation_state = source_state
+            _validate_batch_config(config, kind, validation_state)
+            if state is None and kind == "percolation" and source_state is None:
+                _validate_batch_percolation_start(config)
+            remaining = target_timestep - (state["timestep"] if state is not None else start_timestep)
+            finalizing = False
+            if state is not None and remaining == 0:
+                analysis = load_analysis(directory)
+                finalizing = analysis is None or (
+                    analysis["timestep"] != target_timestep
+                    or not np.array_equal(analysis["tracked_timesteps"], state["tracked_timesteps"])
+                    or not np.array_equal(analysis["diversity_history"], state["diversity_history"])
+                    or analysis["patch_history"][-1] < 0
+                )
+            resume_metadata = {
+                "resumed": state is not None and (remaining > 0 or finalizing),
+                "from_checkpoint": state is not None,
+                "already_completed": state is not None and remaining == 0 and not finalizing,
+                "finalizing": finalizing,
+                "resume_checkpoint": str(checkpoint_path.resolve()) if checkpoint_path else None,
+                "remaining_timesteps": remaining,
+            }
+            if resume_metadata["already_completed"]:
+                result = state
+                if result["patch_history"][-1] < 0:
+                    result["patch_history"][-1] = count_patches(result["lattice"])
+                result["checkpoint_files"] = [str(path.resolve()) for path in candidates]
+                result["removed_checkpoint_files"] = []
+                result["resume_metadata"] = dict(resume_metadata)
+                result["batch_metadata"] = {**metadata, **resume_metadata, "worker_pid": os.getpid()}
+                results[index] = result
+            else:
+                pending.append((config, metadata, state, resume_metadata))
+        except (TypeError, ValueError, OSError) as error:
+            raise type(error)(f"job {index}: {error}") from error
+
+    if not pending:
+        return results
+    cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+    if max_workers is None and hasattr(os, "sched_getaffinity"):
+        cpu_count = len(os.sched_getaffinity(0)) or 1
+    if os.name == "nt":
+        cpu_count = min(cpu_count, 61)
+    max_workers = min(max_workers or cpu_count, len(pending))
+    # All validation is complete before folders are recreated or work begins.
+    for config, _, _, _ in pending:
+        Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    if max_workers == 1:
+        for job in pending:
+            results[job[1]["job_index"]] = _execute_resumed_simulation_job(job, source_state)
+        return results
+    executor = ProcessPoolExecutor(
+        max_workers=max_workers, mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_simulation_worker, initargs=(source_state,),
+    )
+    futures = {}
+    try:
+        for job in pending:
+            futures[executor.submit(_process_resumed_simulation_job, job)] = job
+        for future in as_completed(futures):
+            job = futures[future]
+            results[job[1]["job_index"]] = future.result()
+    except BaseException:
+        _stop_simulation_executor(executor)
+        raise
+    executor.shutdown(wait=True)
+    return results
+
+
 _CHECKPOINT_VERSION = 1
+_PERCOLATION_METADATA_KEYS = (
+    "p", "p_applied", "blocked_sites", "largest_cluster_only",
+    "original_usable_sites", "usable_sites", "removed_cluster_sites",
+    "effective_p",
+)
+
+
+def _percolation_metadata(state):
+    return {key: state[key] for key in _PERCOLATION_METADATA_KEYS if key in state}
 
 
 def _checkpoint_timestep(path):
@@ -164,6 +843,8 @@ def _state_directory(state):
     checkpoint_files = state.get("checkpoint_files") or ()
     if checkpoint_files:
         return Path(checkpoint_files[-1]).expanduser().parent
+    if state.get("source_directory") is not None:
+        return Path(state["source_directory"]).expanduser()
     return None
 
 
@@ -250,25 +931,45 @@ def load_checkpoint(path):
             state["initial_newest_species"] = int(
                 saved["initial_newest_species"]
             )
+        if "patch_history" in saved.files:
+            state["patch_history"] = saved["patch_history"].astype(
+                np.int64, copy=True
+            )
+        state.update({
+            key: saved[key].item() for key in _PERCOLATION_METADATA_KEYS
+            if key in saved.files
+        })
     state["initial_newest_species"] = _initial_newest_species(state)
 
-    # The patch series lives in the run's analysis record rather than in the
-    # snapshot, because most snapshots are deleted once they are counted. A
-    # snapshot from the middle of a run only carries the history up to its own
-    # time, so the record is trimmed to match before it is attached.
+    # The analysis record includes the count of its own snapshot; a checkpoint
+    # additionally stores the known earlier counts for crash recovery. Older
+    # checkpoints rely entirely on analysis. Trim that record to this snapshot's
+    # time, preserving any known prefix if analysis has not caught up yet.
     tracked_count = state["tracked_timesteps"].size
-    patch_history = np.full(tracked_count, _MISSING_PATCH_COUNT, dtype=np.int64)
+    patch_history = state.get("patch_history")
+    if patch_history is None:
+        patch_history = np.full(tracked_count, _MISSING_PATCH_COUNT, dtype=np.int64)
+    elif patch_history.ndim != 1 or patch_history.size != tracked_count:
+        raise ValueError("checkpoint patch_history must match its tracked_timesteps")
     analysis = load_analysis(checkpoint_path)
     if analysis is not None:
         recorded_times = np.asarray(analysis["tracked_timesteps"])
-        if recorded_times.size >= tracked_count and np.array_equal(
-            recorded_times[:tracked_count], state["tracked_timesteps"]
+        overlap = min(recorded_times.size, tracked_count)
+        if overlap and np.array_equal(
+            recorded_times[:overlap], state["tracked_timesteps"][:overlap]
         ):
-            patch_history = np.asarray(
+            # A crash can occur after an atomic snapshot is written but before
+            # its analysis record is replaced. Preserve all known old counts;
+            # the current snapshot's missing count is recomputed on resume.
+            recorded_patches = np.asarray(
                 analysis["patch_history"], dtype=np.int64
-            )[:tracked_count].copy()
+            )[:overlap]
+            known = recorded_patches >= 0
+            patch_history[:overlap][known] = recorded_patches[known]
             state["analysis_path"] = analysis["analysis_path"]
-            state["event_timesteps"] = analysis["event_timesteps"].copy()
+            state["event_timesteps"] = analysis["event_timesteps"][
+                analysis["event_timesteps"] <= state["timestep"]
+            ].copy()
     state["patch_history"] = patch_history
     return state
 
@@ -418,6 +1119,12 @@ def _normalize_initial_state(initial_state):
         "initial_newest_species": initial_newest_species,
         "rng_state": dict(rng_state) if rng_state is not None else None,
         "source_directory": _state_directory(initial_state),
+        # Transient provenance for an explicitly prepared branch. New
+        # snapshots omit it so they can subsequently resume in their own folder.
+        "_cluster_pruning_source_directory": initial_state.get(
+            "_cluster_pruning_source_directory"
+        ),
+        **_percolation_metadata(initial_state),
     }
 
 
@@ -475,6 +1182,9 @@ def _write_checkpoint(checkpoint_dir, state):
                 alpha=np.float64(state["alpha"]),
                 track_every=np.int64(state["track_every"]),
                 populate_first_100=np.bool_(state["populate_first_100"]),
+                **({"patch_history": np.asarray(state["patch_history"], dtype=np.int64)}
+                   if "patch_history" in state else {}),
+                **_percolation_metadata(state),
             )
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
@@ -678,6 +1388,7 @@ def _write_analysis(checkpoint_dir, record):
                 lattice_shape=np.asarray(
                     record["lattice_shape"], dtype=np.int64
                 ),
+                **_percolation_metadata(record),
             )
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
@@ -720,6 +1431,9 @@ def load_analysis(path):
     record["alpha"] = float(record["alpha"])
     record["populate_first_100"] = bool(record["populate_first_100"])
     record["initial_newest_species"] = _initial_newest_species(record)
+    for key in _PERCOLATION_METADATA_KEYS:
+        if key in record:
+            record[key] = record[key].item()
     record["analysis_path"] = str(analysis_path.resolve())
     return record
 
@@ -1674,6 +2388,18 @@ def _grow_species_storage(
     )
 
 
+@njit(cache=True, inline="never")
+def _has_introduction(draws, probability, forced_timesteps, timestep):
+    """Check already drawn trials without enlarging the compiled invasion loop."""
+    if timestep <= forced_timesteps:
+        return True
+    if probability > 0:
+        for draw in draws:
+            if draw < probability:
+                return True
+    return False
+
+
 @njit(cache=True)
 def _run_compiled_simulation(
     slot_lattice,
@@ -1704,6 +2430,7 @@ def _run_compiled_simulation(
         records += 1
     diversity_history = np.empty(records, dtype=np.int64)
     record_index = 0
+    flat_neighbours = neighbours.ravel()
 
     for timestep in range(1, timesteps + 1):
         # Each code uniformly selects one of the N sites and one of its four
@@ -1711,13 +2438,32 @@ def _run_compiled_simulation(
         event_codes = rng.integers(0, 4 * total_sites, size=total_sites)
         introduction_draws = rng.random(total_sites)
 
+        # With no species, or one species occupying every usable site, all
+        # invasions are ineffective. Keep both complete random draws above,
+        # and skip only time units without any introduction. Empty usable
+        # sites disable the single-species shortcut because they can be filled.
+        if live_count == 0 or (
+            live_count == 1
+            and species_counts[active_slots[0]] == usable_count
+        ):
+            if not _has_introduction(
+                introduction_draws,
+                introduction_probability,
+                forced_introduction_timesteps,
+                timestep,
+            ):
+                if timestep % track_every == 0 or timestep == timesteps:
+                    diversity_history[record_index] = live_count
+                    record_index += 1
+                continue
+
         for event in range(total_sites):
             source_site = event_codes[event] >> 2
-            direction = event_codes[event] & 3
             source_slot = slot_lattice[source_site]
 
             if source_slot >= 0:
-                target_site = neighbours[source_site, direction]
+                # The code is already 4 * source_site + direction.
+                target_site = flat_neighbours[event_codes[event]]
                 target_slot = slot_lattice[target_site]
 
                 if target_slot == -1:  # Empty, usable site.
@@ -1857,7 +2603,8 @@ def _export_simulation_state(state, rows, columns):
 
     live_slots = active_slots[:live_count].astype(np.intp)
     current_species = slot_species_ids[live_slots].astype(np.int64).tolist()
-    compact_Gamma = Gamma[np.ix_(live_slots, live_slots)].copy()
+    # Advanced indexing already produces an independent copy.
+    compact_Gamma = Gamma[np.ix_(live_slots, live_slots)]
 
     external_flat = np.zeros(slot_lattice.size, dtype=np.int64)
     external_flat[slot_lattice == -2] = -1
@@ -1894,8 +2641,10 @@ def _simulate_lattice(
     checkpoint_dir=None,
     retention=None,
     target_timestep=None,
+    geometry_metadata=None,
 ):
     """Prepare state and run the exact sequential model in compiled code."""
+    geometry_metadata = {} if geometry_metadata is None else geometry_metadata
     if not _NUMBA_AVAILABLE:
         raise ImportError(
             "Fast simulations require numba; install it with 'pip install numba'"
@@ -1948,15 +2697,36 @@ def _simulate_lattice(
     species_to_slot = {
         int(species): slot for slot, species in enumerate(current_species)
     }
-    for site in np.flatnonzero(external_flat > 0):
-        slot_lattice[site] = species_to_slot[int(external_flat[site])]
+    occupied_sites = external_flat > 0
+    occupied_species, inverse_slots = np.unique(
+        external_flat[occupied_sites], return_inverse=True
+    )
+    if set(species_to_slot) != set(occupied_species.tolist()):
+        raise ValueError("current_species does not match the species in lattice")
+    # Map the sorted IDs back to the supplied species order. This keeps Gamma
+    # slots identical while moving the per-site work out of Python.
+    ordered_slots = np.asarray(
+        [species_to_slot[int(species)] for species in occupied_species],
+        dtype=np.int32,
+    )
+    slot_lattice[occupied_sites] = ordered_slots[inverse_slots]
+    del occupied_sites, occupied_species, inverse_slots, ordered_slots
+    del external_flat, species_to_slot
 
-    site_numbers = np.arange(total_sites, dtype=np.intp).reshape(rows, columns)
-    neighbours = np.empty((total_sites, 4), dtype=np.intp)
+    # The table is read at random for every invasion attempt. Smaller indices
+    # halve its memory footprint and improve cache use on ordinary lattices.
+    site_index_dtype = (
+        np.int32 if total_sites <= np.iinfo(np.int32).max else np.intp
+    )
+    site_numbers = np.arange(total_sites, dtype=site_index_dtype).reshape(
+        rows, columns
+    )
+    neighbours = np.empty((total_sites, 4), dtype=site_index_dtype)
     neighbours[:, 0] = np.roll(site_numbers, 1, axis=0).ravel()
     neighbours[:, 1] = np.roll(site_numbers, -1, axis=1).ravel()
     neighbours[:, 2] = np.roll(site_numbers, -1, axis=0).ravel()
     neighbours[:, 3] = np.roll(site_numbers, 1, axis=1).ravel()
+    del site_numbers
 
     live_count = len(current_species)
     capacity = 4
@@ -1979,9 +2749,6 @@ def _simulate_lattice(
     free_slots = np.empty(capacity, dtype=np.int32)
     next_unused_slot = live_count
     free_count = 0
-
-    if set(species_to_slot) != set(int(value) for value in external_flat if value > 0):
-        raise ValueError("current_species does not match the species in lattice")
 
     if prior_tracked_timesteps is None:
         prior_tracked_timesteps = np.array(
@@ -2012,6 +2779,7 @@ def _simulate_lattice(
         # The starting lattice is in hand, so its patch count costs nothing
         # here and makes the sample the leg resumes from safe to delete.
         prior_patch_history[-1] = count_patches(lattice)
+    del lattice
 
     if retention is None:
         retention = RetentionPolicy()
@@ -2019,6 +2787,21 @@ def _simulate_lattice(
     if checkpoint_dir is not None:
         snapshot_retention = _CheckpointRetention(checkpoint_dir, retention)
         snapshot_retention.adopt_existing()
+        # Retention grants around already detected swaps survive a restart.
+        # A later estimate cannot revoke them: some intervening snapshots may
+        # already have been pruned under that earlier decision.
+        existing_analysis = load_analysis(checkpoint_dir)
+        if existing_analysis is not None:
+            recorded_times = np.asarray(existing_analysis["tracked_timesteps"])
+            overlap = min(recorded_times.size, prior_tracked_timesteps.size)
+            if overlap and np.array_equal(
+                recorded_times[:overlap], prior_tracked_timesteps[:overlap]
+            ):
+                snapshot_retention.events = np.asarray(
+                    existing_analysis["event_timesteps"], dtype=np.int64
+                )[
+                    existing_analysis["event_timesteps"] <= int(initial_timestep)
+                ].copy()
 
     progress_bar = None
     if progress:
@@ -2044,9 +2827,21 @@ def _simulate_lattice(
         newest_species,
     )
 
-    diversity_chunks = []
-    timestep_chunks = []
-    patch_counts = []
+    new_timesteps = int(initial_timestep) + _tracking_timesteps(
+        int(T), int(track_every)
+    )
+    prior_sample_count = prior_tracked_timesteps.size
+    sample_count = prior_sample_count + new_timesteps.size
+    tracked_timesteps = np.empty(sample_count, dtype=np.int64)
+    tracked_timesteps[:prior_sample_count] = prior_tracked_timesteps
+    tracked_timesteps[prior_sample_count:] = new_timesteps
+    diversity_history = np.empty(sample_count, dtype=np.int64)
+    diversity_history[:prior_sample_count] = prior_diversity_history
+    patch_history = np.full(
+        sample_count, _MISSING_PATCH_COUNT, dtype=np.int64
+    )
+    patch_history[:prior_sample_count] = prior_patch_history
+    recorded_samples = prior_sample_count
     checkpoint_files = []
     removed_files = set()
 
@@ -2065,11 +2860,8 @@ def _simulate_lattice(
                 int(track_every),
             )
             state = result[:-1]
-            diversity_chunks.append(result[-1])
-            timestep_chunks.append(
-                int(initial_timestep)
-                + _tracking_timesteps(int(T), int(track_every))
-            )
+            diversity_history[recorded_samples:] = result[-1]
+            recorded_samples = sample_count
     else:
         previous_timestep = 0
         if checkpoint_dir is not None:
@@ -2101,12 +2893,11 @@ def _simulate_lattice(
                     int(track_every),
                 )
                 state = result[:-1]
-                diversity_chunks.append(result[-1])
-                timestep_chunks.append(
-                    int(initial_timestep)
-                    + previous_timestep
-                    + _tracking_timesteps(chunk_size, int(track_every))
+                next_recorded_samples = recorded_samples + result[-1].size
+                diversity_history[recorded_samples:next_recorded_samples] = (
+                    result[-1]
                 )
+                recorded_samples = next_recorded_samples
                 if progress_bar is not None:
                     progress_bar.update(chunk_size)
                 forced_introduction_timesteps = max(
@@ -2118,12 +2909,10 @@ def _simulate_lattice(
                     exported = _export_simulation_state(
                         state, rows, columns
                     )
-                    tracked_so_far = np.concatenate(
-                        [prior_tracked_timesteps, *timestep_chunks]
-                    )
-                    diversity_so_far = np.concatenate(
-                        [prior_diversity_history, *diversity_chunks]
-                    )
+                    # Only expose the filled prefix. Earlier samples stay in
+                    # place instead of being recopied after every checkpoint.
+                    tracked_so_far = tracked_timesteps[:recorded_samples]
+                    diversity_so_far = diversity_history[:recorded_samples]
                     snapshot_timestep = (
                         int(initial_timestep) + previous_timestep
                     )
@@ -2133,12 +2922,17 @@ def _simulate_lattice(
                             "target_timestep": target_timestep,
                             "tracked_timesteps": tracked_so_far,
                             "diversity_history": diversity_so_far,
+                            # Preserve the known prefix even if the subsequent
+                            # atomic analysis write is interrupted. The current
+                            # snapshot is counted immediately after this write.
+                            "patch_history": patch_history[:recorded_samples],
                             "initial_newest_species": initial_newest_species,
                             "rng_state": rng.bit_generator.state,
                             "gamma": float(gamma),
                             "alpha": float(alpha),
                             "track_every": int(track_every),
                             "populate_first_100": bool(populate_first_100),
+                            **geometry_metadata,
                         }
                     )
                     written_file = _write_checkpoint(checkpoint_dir, exported)
@@ -2147,16 +2941,10 @@ def _simulate_lattice(
                     # Patches are counted here, while the lattice is in
                     # memory, because retention deletes most snapshots and
                     # the count could not be recovered afterwards.
-                    patch_counts.append(count_patches(exported["lattice"]))
-                    patch_so_far = _align_patch_history(
-                        np.concatenate(
-                            [
-                                prior_patch_history,
-                                np.asarray(patch_counts, dtype=np.int64),
-                            ]
-                        ),
-                        tracked_so_far.size,
+                    patch_history[recorded_samples - 1] = count_patches(
+                        exported["lattice"]
                     )
+                    patch_so_far = patch_history[:recorded_samples]
                     removed_files.update(
                         snapshot_retention.record(
                             written_file,
@@ -2181,26 +2969,12 @@ def _simulate_lattice(
                             "track_every": int(track_every),
                             "populate_first_100": bool(populate_first_100),
                             "lattice_shape": (rows, columns),
+                            **geometry_metadata,
                         },
                     )
         finally:
             if progress_bar is not None:
                 progress_bar.close()
-
-    tracked_timesteps = np.concatenate(
-        [prior_tracked_timesteps, *timestep_chunks]
-    )
-    diversity_history = np.concatenate(
-        [prior_diversity_history, *diversity_chunks]
-    )
-    # A leg that never wrote snapshots leaves its new samples uncounted, so
-    # the series is padded rather than assumed complete.
-    patch_history = _align_patch_history(
-        np.concatenate(
-            [prior_patch_history, np.asarray(patch_counts, dtype=np.int64)]
-        ),
-        tracked_timesteps.size,
-    )
 
     analysis_path = None
     event_timesteps = np.empty(0, dtype=np.int64)
@@ -2228,6 +3002,7 @@ def _simulate_lattice(
                 "track_every": int(track_every),
                 "populate_first_100": bool(populate_first_100),
                 "lattice_shape": (rows, columns),
+                **geometry_metadata,
             },
         )
         checkpoint_files = [
@@ -2235,6 +3010,7 @@ def _simulate_lattice(
         ]
 
     final_result = _export_simulation_state(state, rows, columns)
+    final_result.update(geometry_metadata)
     final_result.update(
         {
             "introduction_probability": float(introduction_probability),
@@ -2298,6 +3074,11 @@ def simulation_from_state(
     )
     _validate_gamma(gamma)
     state = _normalize_initial_state(initial_state)
+    pruning_source = state.get("_cluster_pruning_source_directory")
+    if pruning_source is not None and checkpoint_dir is not None and _same_directory(
+        pruning_source, checkpoint_dir
+    ):
+        raise ValueError("cluster pruning requires a new checkpoint_dir")
     if continue_history is None:
         continue_history = _same_directory(
             state["source_directory"], checkpoint_dir
@@ -2312,7 +3093,7 @@ def simulation_from_state(
     rng = _make_rng(seed, state["rng_state"])
     if target_timestep is None:
         target_timestep = state["timestep"] + int(T)
-    return _simulate_lattice(
+    result = _simulate_lattice(
         state["lattice"],
         state["current_species"],
         state["newest_species"],
@@ -2332,7 +3113,11 @@ def simulation_from_state(
         checkpoint_dir=checkpoint_dir,
         retention=retention,
         target_timestep=target_timestep,
+        geometry_metadata=_percolation_metadata(state),
     )
+    if checkpoint_dir is None and pruning_source is not None:
+        result["_cluster_pruning_source_directory"] = pruning_source
+    return result
 
 
 def main_simulation(
@@ -2411,6 +3196,97 @@ def main_simulation(
     )
 
 
+@njit(cache=True)
+def _largest_usable_cluster_mask(usable):
+    """Select the largest four-neighbour component on a periodic lattice.
+
+    Equal-sized components are resolved by their first row-major site. This
+    uses no randomness and treats empty and occupied usable sites alike.
+    """
+    rows, columns = usable.shape
+    parent = np.arange(usable.size, dtype=np.int64)
+    sizes = np.ones(usable.size, dtype=np.int64)
+    for row in range(rows):
+        for column in range(columns):
+            if not usable[row, column]:
+                continue
+            site = row * columns + column
+            right = (column + 1) % columns
+            down = (row + 1) % rows
+            if usable[row, right]:
+                _merge_patch_sites(parent, sizes, site, row * columns + right)
+            if usable[down, column]:
+                _merge_patch_sites(parent, sizes, site, down * columns + column)
+
+    best_root = -1
+    best_size = 0
+    for site in range(usable.size):
+        if usable[site // columns, site % columns]:
+            root = _patch_root(parent, site)
+            if sizes[root] > best_size:
+                best_root = root
+                best_size = sizes[root]
+    selected = np.zeros(usable.shape, dtype=np.bool_)
+    for site in range(usable.size):
+        if usable[site // columns, site % columns]:
+            selected[site // columns, site % columns] = (
+                _patch_root(parent, site) == best_root
+            )
+    return selected
+
+
+def keep_largest_cluster(initial_state):
+    """Copy a state, block smaller usable components, and start a new history.
+
+    Connectivity follows the model's four neighbours and periodic boundaries,
+    regardless of species. Empty sites (0) also connect; blocked sites (-1) do
+    not. Gamma is restricted to surviving species in their original order.
+    Species IDs, simulation time, and the saved random state are preserved.
+    The source checkpoint and input arrays are never modified.
+    """
+    if isinstance(initial_state, (str, os.PathLike)):
+        initial_state = load_checkpoint(initial_state)
+    state = _normalize_initial_state(initial_state)
+    selected = _largest_usable_cluster_mask(state["lattice"] != -1)
+    current_usable = int(np.count_nonzero(state["lattice"] != -1))
+    original_usable = current_usable
+    if state.get("largest_cluster_only"):
+        original_usable = int(state.get("original_usable_sites", original_usable))
+    state["lattice"][~selected] = -1
+    surviving_ids = set(np.unique(state["lattice"][state["lattice"] > 0]).tolist())
+    surviving_positions = [
+        index for index, species in enumerate(state["current_species"])
+        if species in surviving_ids
+    ]
+    state["Gamma"] = state["Gamma"][np.ix_(surviving_positions, surviving_positions)]
+    state["current_species"] = [state["current_species"][index] for index in surviving_positions]
+    state["rng_state"] = deepcopy(state["rng_state"])
+    state["tracked_timesteps"] = np.array([state["timestep"]], dtype=np.int64)
+    state["diversity_history"] = np.array([len(surviving_positions)], dtype=np.int64)
+    state["patch_history"] = np.array([_MISSING_PATCH_COUNT], dtype=np.int64)
+    state["initial_newest_species"] = state["newest_species"]
+    usable = int(np.count_nonzero(selected))
+    # Explicit preparation resets histories even if the mask was connected.
+    # It must never replace the original checkpoint folder's analysis record.
+    if state["source_directory"] is not None:
+        state["_cluster_pruning_source_directory"] = state["source_directory"]
+    state.update({
+        "diversity": len(surviving_positions),
+        "largest_cluster_only": True,
+        "original_usable_sites": original_usable,
+        "usable_sites": usable,
+        "removed_cluster_sites": original_usable - usable,
+        "blocked_sites": selected.size - usable,
+        "effective_p": (selected.size - usable) / selected.size,
+    })
+    result = {**initial_state, **state}
+    # A prepared state carries provenance, but never the old run's plot data.
+    for key in ("checkpoint_path", "analysis_path", "checkpoint_files",
+                "removed_checkpoint_files", "event_timesteps", "batch_metadata"):
+        result.pop(key, None)
+    return result
+
+
 def percolation_simulation(
     L_col,
     L_row,
@@ -2427,11 +3303,15 @@ def percolation_simulation(
     checkpoint_dir=None,
     retention=None,
     continue_history=None,
+    largest_cluster_only=True,
 ):
     """Run the simulation with permanent random site removal.
 
     This is an extension of the paper's base model. Each site is independently
-    blocked with probability ``p`` before initialization. Blocked sites remain
+    blocked with probability ``p`` before initialization. By default only the
+    largest remaining periodic four-neighbour component is kept; all other
+    sites are permanently blocked too. Set ``largest_cluster_only=False`` to
+    retain the earlier independent-removal behavior. Blocked sites remain
     -1 and cannot invade, be invaded, or receive introductions. A blocked
     source draw is simply a null event, so one time unit still contains ``N``
     microscopic updates and uses introduction probability ``alpha*gamma/N``.
@@ -2447,12 +3327,45 @@ def percolation_simulation(
         raise TypeError("p must be a real number")
     if not 0 <= p <= 1:
         raise ValueError("p must be between 0 and 1")
+    if not isinstance(largest_cluster_only, (bool, np.bool_)):
+        raise TypeError("largest_cluster_only must be a boolean")
 
     if initial_state is not None:
         # Site removal is an initialization rule. Existing -1 cells are kept;
-        # changing p cannot reblock an already-running lattice.
-        result = simulation_from_state(
-            initial_state,
+        # p is not drawn again when branching from an existing geometry.
+        state = _normalize_initial_state(initial_state)
+        original_usable = int(np.count_nonzero(state["lattice"] != -1))
+        if largest_cluster_only:
+            prepared = keep_largest_cluster(state)
+            if prepared["usable_sites"] < original_usable:
+                if continue_history is not None and not isinstance(
+                    continue_history, (bool, np.bool_)
+                ):
+                    raise TypeError("continue_history must be True, False, or None")
+                if continue_history:
+                    raise ValueError("cluster pruning changes the geometry; use a new history")
+                if checkpoint_dir is not None and _same_directory(
+                    state["source_directory"], checkpoint_dir
+                ):
+                    raise ValueError("cluster pruning requires a new checkpoint_dir")
+                state = prepared
+                continue_history = False
+            else:
+                state.update(_percolation_metadata(prepared))
+        else:
+            original_usable = int(state.get("original_usable_sites", original_usable))
+            usable = int(np.count_nonzero(state["lattice"] != -1))
+            state.update({
+                "largest_cluster_only": False,
+                "original_usable_sites": original_usable,
+                "usable_sites": usable,
+                "removed_cluster_sites": original_usable - usable,
+                "blocked_sites": state["lattice"].size - usable,
+                "effective_p": (state["lattice"].size - usable) / state["lattice"].size,
+            })
+        state.update({"p": float(p), "p_applied": False})
+        return simulation_from_state(
+            state,
             gamma=gamma,
             alpha=alpha,
             T=T,
@@ -2464,10 +3377,6 @@ def percolation_simulation(
             retention=retention,
             continue_history=continue_history,
         )
-        result["p"] = float(p)
-        result["p_applied"] = False
-        result["blocked_sites"] = int(np.count_nonzero(result["lattice"] == -1))
-        return result
 
     # Reuse create_lattice for input validation without consuming randomness.
     values = (L_col, L_row, D)
@@ -2485,7 +3394,20 @@ def percolation_simulation(
     rng = _make_rng(seed)
     total_sites = L_row * L_col
     blocked = rng.random(total_sites) < p
+    original_usable = int(np.count_nonzero(~blocked))
+    if largest_cluster_only:
+        blocked = ~_largest_usable_cluster_mask((~blocked).reshape(L_row, L_col)).ravel()
     active_sites = np.flatnonzero(~blocked)
+    geometry_metadata = {
+        "p": float(p),
+        "p_applied": True,
+        "largest_cluster_only": bool(largest_cluster_only),
+        "original_usable_sites": original_usable,
+        "usable_sites": int(active_sites.size),
+        "removed_cluster_sites": original_usable - int(active_sites.size),
+        "blocked_sites": int(blocked.sum()),
+        "effective_p": int(blocked.sum()) / total_sites,
+    }
     if active_sites.size > 0 and D == 0:
         raise ValueError("D must be positive when usable sites remain")
     if D > active_sites.size:
@@ -2520,10 +3442,8 @@ def percolation_simulation(
         populate_first_100,
         checkpoint_dir=checkpoint_dir,
         retention=retention,
+        geometry_metadata=geometry_metadata,
     )
-    result["p"] = float(p)
-    result["p_applied"] = True
-    result["blocked_sites"] = int(blocked.sum())
     return result
 
 

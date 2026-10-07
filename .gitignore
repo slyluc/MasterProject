@@ -21,3 +21,6 @@ __pycache__/
 
 # Generated lattice animations
 /animations/
+
+# Generated benchmark results
+/tools/benchmark_*_results.json
