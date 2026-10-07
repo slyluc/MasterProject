@@ -64,6 +64,10 @@ class SimulationConfig:
     retention: "RetentionPolicy | None" = None
     # Keep only the largest periodic four-neighbour usable component at start.
     largest_cluster_only: bool = True
+    # Reject new-species link proposals that create a directed cycle of lengths
+    # 2 through this inclusive bound. None leaves the original model unchanged.
+    max_forbidden_cycle_length: int | None = None
+    max_cycle_rejection_attempts: int = 1_000_000
 
     def run_main(self, initial_state=None, continue_history=None):
         """Run the ordinary simulation using the current settings."""
@@ -82,6 +86,8 @@ class SimulationConfig:
             checkpoint_dir=self.checkpoint_dir,
             retention=self.retention,
             continue_history=continue_history,
+            max_forbidden_cycle_length=self.max_forbidden_cycle_length,
+            max_cycle_rejection_attempts=self.max_cycle_rejection_attempts,
         )
 
     def run_percolation(self, initial_state=None, continue_history=None):
@@ -103,6 +109,8 @@ class SimulationConfig:
             retention=self.retention,
             continue_history=continue_history,
             largest_cluster_only=self.largest_cluster_only,
+            max_forbidden_cycle_length=self.max_forbidden_cycle_length,
+            max_cycle_rejection_attempts=self.max_cycle_rejection_attempts,
         )
 
     def run_many(
@@ -148,6 +156,8 @@ class SimulationConfig:
             retention=self.retention,
             target_timestep=target,
             continue_history=True,
+            max_forbidden_cycle_length=self.max_forbidden_cycle_length,
+            max_cycle_rejection_attempts=self.max_cycle_rejection_attempts,
         )
 
 
@@ -196,6 +206,13 @@ def _validate_batch_config(config, kind, initial_state):
         config.populate_first_100,
     )
     _validate_gamma(config.gamma)
+    cycle_limit = _validate_cycle_rejection_options(
+        config.max_forbidden_cycle_length, config.max_cycle_rejection_attempts
+    )
+    if initial_state is not None and cycle_limit and _has_forbidden_directed_cycle(
+        initial_state["Gamma"], cycle_limit
+    ):
+        raise ValueError("initial Gamma contains a forbidden directed cycle")
     if config.retention is not None and not isinstance(
         config.retention, RetentionPolicy
     ):
@@ -222,6 +239,14 @@ def _validate_batch_config(config, kind, initial_state):
     else:
         sites = initial_state["lattice"].size
         usable_sites = np.count_nonzero(initial_state["lattice"] != -1)
+    if cycle_limit and config.gamma == 1:
+        if initial_state is None and config.D > 1:
+            raise ValueError("gamma=1 cannot initialize multiple species without forbidden cycles")
+        start = 0 if initial_state is None else initial_state["timestep"]
+        if usable_sites and config.T and (
+            config.alpha > 0 or (config.populate_first_100 and start < 100)
+        ):
+            raise ValueError("gamma=1 cannot support repeated introductions without forbidden cycles")
     if usable_sites and config.alpha * config.gamma / sites > 1:
         raise ValueError("alpha * gamma / N cannot exceed 1")
 
@@ -253,6 +278,10 @@ def _validate_batch_percolation_start(config):
         raise ValueError(f"D={config.D} exceeds the {usable} usable sites")
     if usable and config.alpha * config.gamma / sites > 1:
         raise ValueError("alpha * gamma / N cannot exceed 1")
+    if usable and config.max_forbidden_cycle_length is not None and config.gamma == 1 and config.T and (
+        config.alpha > 0 or config.populate_first_100
+    ):
+        raise ValueError("gamma=1 cannot support repeated introductions without forbidden cycles")
 
 
 def _initialize_simulation_worker(initial_state):
@@ -423,6 +452,9 @@ def run_simulations(
     if initial_state is not None:
         state = _normalize_initial_state(initial_state)
         state["rng_state"] = None
+        for config in configs:
+            if config.max_forbidden_cycle_length is None:
+                config.max_forbidden_cycle_length = state.get("max_forbidden_cycle_length")
     for index, config in enumerate(configs):
         try:
             _validate_batch_config(config, kind, state)
@@ -562,6 +594,8 @@ def _execute_resumed_simulation_job(job, initial_state):
                     retention=config.retention,
                     target_timestep=int(state["target_timestep"]),
                     continue_history=True,
+                    max_forbidden_cycle_length=config.max_forbidden_cycle_length,
+                    max_cycle_rejection_attempts=config.max_cycle_rejection_attempts,
                 )
         except Exception as error:
             raise RuntimeError(
@@ -718,6 +752,10 @@ def resume_simulations(checkpoint_root, *, max_workers=None, initial_state=None)
                 for key in ("gamma", "alpha", "track_every", "populate_first_100"):
                     if state[key] != getattr(config, key):
                         raise ValueError(f"checkpoint {key} does not match the saved job")
+                for key, default in (("max_forbidden_cycle_length", None),
+                                     ("max_cycle_rejection_attempts", 1_000_000)):
+                    if state.get(key, default) != getattr(config, key):
+                        raise ValueError(f"checkpoint {key} does not match the saved job")
                 if kind == "percolation":
                     for key in ("p", "largest_cluster_only"):
                         if key in state and state[key] != getattr(config, key):
@@ -808,6 +846,14 @@ _PERCOLATION_METADATA_KEYS = (
     "original_usable_sites", "usable_sites", "removed_cluster_sites",
     "effective_p",
 )
+_CYCLE_METADATA_KEYS = ("max_forbidden_cycle_length", "max_cycle_rejection_attempts")
+
+
+def _cycle_metadata(state, *, stored=False):
+    metadata = {key: state[key] for key in _CYCLE_METADATA_KEYS if key in state}
+    if stored and metadata.get("max_forbidden_cycle_length", 0) is None:
+        metadata["max_forbidden_cycle_length"] = 0
+    return metadata
 
 
 def _percolation_metadata(state):
@@ -939,6 +985,10 @@ def load_checkpoint(path):
             key: saved[key].item() for key in _PERCOLATION_METADATA_KEYS
             if key in saved.files
         })
+        if "max_forbidden_cycle_length" in saved.files:
+            state["max_forbidden_cycle_length"] = int(saved["max_forbidden_cycle_length"]) or None
+        if "max_cycle_rejection_attempts" in saved.files:
+            state["max_cycle_rejection_attempts"] = int(saved["max_cycle_rejection_attempts"])
     state["initial_newest_species"] = _initial_newest_species(state)
 
     # The analysis record includes the count of its own snapshot; a checkpoint
@@ -1125,6 +1175,7 @@ def _normalize_initial_state(initial_state):
             "_cluster_pruning_source_directory"
         ),
         **_percolation_metadata(initial_state),
+        **_cycle_metadata(initial_state),
     }
 
 
@@ -1185,6 +1236,7 @@ def _write_checkpoint(checkpoint_dir, state):
                 **({"patch_history": np.asarray(state["patch_history"], dtype=np.int64)}
                    if "patch_history" in state else {}),
                 **_percolation_metadata(state),
+                **_cycle_metadata(state, stored=True),
             )
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
@@ -1389,6 +1441,7 @@ def _write_analysis(checkpoint_dir, record):
                     record["lattice_shape"], dtype=np.int64
                 ),
                 **_percolation_metadata(record),
+                **_cycle_metadata(record, stored=True),
             )
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
@@ -1434,6 +1487,10 @@ def load_analysis(path):
     for key in _PERCOLATION_METADATA_KEYS:
         if key in record:
             record[key] = record[key].item()
+    if "max_forbidden_cycle_length" in record:
+        record["max_forbidden_cycle_length"] = int(record["max_forbidden_cycle_length"]) or None
+    if "max_cycle_rejection_attempts" in record:
+        record["max_cycle_rejection_attempts"] = int(record["max_cycle_rejection_attempts"])
     record["analysis_path"] = str(analysis_path.resolve())
     return record
 
@@ -2211,6 +2268,120 @@ def create_lattice(L_col, L_row, D, rng=None):
 
     return lattice, current_species, diversity, newest_species
 
+def _validate_cycle_rejection_options(
+    max_forbidden_cycle_length, max_cycle_rejection_attempts=1_000_000
+):
+    """Validate the optional directed-cycle restriction without drawing RNG."""
+    if max_forbidden_cycle_length is None:
+        max_cycle_length = 0
+    else:
+        if isinstance(max_forbidden_cycle_length, (bool, np.bool_)) or not isinstance(
+            max_forbidden_cycle_length, (int, np.integer)
+        ):
+            raise TypeError("max_forbidden_cycle_length must be an integer or None")
+        if max_forbidden_cycle_length < 2:
+            raise ValueError("max_forbidden_cycle_length must be at least 2")
+        max_cycle_length = int(max_forbidden_cycle_length)
+    if isinstance(max_cycle_rejection_attempts, (bool, np.bool_)) or not isinstance(
+        max_cycle_rejection_attempts, (int, np.integer)
+    ):
+        raise TypeError("max_cycle_rejection_attempts must be an integer")
+    if max_cycle_rejection_attempts <= 0:
+        raise ValueError("max_cycle_rejection_attempts must be positive")
+    return max_cycle_length
+
+
+@njit(cache=True)
+def _has_forbidden_directed_cycle(Gamma, max_cycle_length):
+    """Find a directed cycle of length 2 through the specified bound.
+
+    Breadth-first searches stop after the bounded number of edges. Diagonal
+    entries are excluded because species have no directed self-interaction.
+    """
+    if max_cycle_length < 2:
+        return False
+    species_count = Gamma.shape[0]
+    queue = np.empty(species_count, dtype=np.int32)
+    distances = np.empty(species_count, dtype=np.int32)
+    for source in range(species_count):
+        distances[:] = -1
+        distances[source] = 0
+        queue[0] = source
+        queue_start = 0
+        queue_end = 1
+        while queue_start < queue_end:
+            current = queue[queue_start]
+            queue_start += 1
+            next_distance = distances[current] + 1
+            for target in range(species_count):
+                if target == current or Gamma[current, target] == 0:
+                    continue
+                if target == source:
+                    if 2 <= next_distance <= max_cycle_length:
+                        return True
+                elif next_distance < max_cycle_length and distances[target] == -1:
+                    distances[target] = next_distance
+                    queue[queue_end] = target
+                    queue_end += 1
+    return False
+
+
+@njit(cache=True)
+def _new_species_closes_forbidden_cycle(
+    Gamma, active_slots, live_count, new_slot, max_cycle_length
+):
+    """Check only cycles through a candidate new species in active storage.
+
+    A cycle new -> outgoing -> ... -> incoming -> new is forbidden when the
+    old-species path has at most ``max_cycle_length - 2`` edges. Multi-source
+    BFS gives that minimum path length while ignoring unused or extinct slots.
+    """
+    if max_cycle_length < 2 or live_count == 0:
+        return False
+    has_outgoing = False
+    has_incoming = False
+    for position in range(live_count):
+        other_slot = active_slots[position]
+        outgoing = Gamma[new_slot, other_slot] != 0
+        incoming = Gamma[other_slot, new_slot] != 0
+        has_outgoing = has_outgoing or outgoing
+        has_incoming = has_incoming or incoming
+        if outgoing and incoming:
+            return True
+    if max_cycle_length == 2 or not has_outgoing or not has_incoming:
+        return False
+
+    distances = np.full(live_count, -1, dtype=np.int32)
+    queue = np.empty(live_count, dtype=np.int32)
+    queue_start = 0
+    queue_end = 0
+    for position in range(live_count):
+        if Gamma[new_slot, active_slots[position]]:
+            distances[position] = 0
+            queue[queue_end] = position
+            queue_end += 1
+
+    while queue_start < queue_end:
+        current_position = queue[queue_start]
+        queue_start += 1
+        current_slot = active_slots[current_position]
+        next_distance = distances[current_position] + 1
+        if next_distance > max_cycle_length - 2:
+            continue
+        for target_position in range(live_count):
+            if distances[target_position] != -1:
+                continue
+            target_slot = active_slots[target_position]
+            if Gamma[current_slot, target_slot] == 0:
+                continue
+            if Gamma[target_slot, new_slot]:
+                return True
+            distances[target_position] = next_distance
+            queue[queue_end] = target_position
+            queue_end += 1
+    return False
+
+
 def update_Gamma(
     Gamma,
     gamma,
@@ -2218,6 +2389,8 @@ def update_Gamma(
     newest_species,
     invaded_species=None,
     rng=None,
+    max_forbidden_cycle_length=None,
+    max_cycle_rejection_attempts=1_000_000,
 ):
     """Add one species to the directed invasion matrix.
 
@@ -2230,6 +2403,9 @@ def update_Gamma(
     Otherwise, one species is added and the function returns the updated
     matrix, live-species list, and newest species ID. The new species is
     guaranteed to invade ``invaded_species`` when it is not ``None`` or 0.
+    When ``max_forbidden_cycle_length`` is enabled, all candidate connections
+    are redrawn at the same ``gamma`` until no directed cycle of length 2
+    through that bound is created. Longer cycles remain possible.
     """
     if (
         isinstance(gamma, (bool, np.bool_))
@@ -2238,6 +2414,9 @@ def update_Gamma(
         raise TypeError("gamma must be a real number")
     if not 0 <= gamma <= 1:
         raise ValueError("gamma must be between 0 and 1")
+    max_cycle_length = _validate_cycle_rejection_options(
+        max_forbidden_cycle_length, max_cycle_rejection_attempts
+    )
 
     if isinstance(newest_species, (bool, np.bool_)) or not isinstance(
         newest_species, (int, np.integer)
@@ -2277,9 +2456,19 @@ def update_Gamma(
     expected_shape = (active_count, active_count)
     random_source = np.random if rng is None else rng
     if Gamma is None:
-        Gamma = (random_source.random(expected_shape) < gamma).astype(np.uint8)
-        np.fill_diagonal(Gamma, 0)
-        return Gamma
+        if max_cycle_length and gamma == 1 and active_count > 1:
+            raise ValueError("gamma=1 cannot produce a directed-cycle-free initial Gamma")
+        for attempt in range(max_cycle_rejection_attempts):
+            Gamma = (random_source.random(expected_shape) < gamma).astype(np.uint8)
+            np.fill_diagonal(Gamma, 0)
+            if not max_cycle_length or not _has_forbidden_directed_cycle(
+                Gamma, max_cycle_length
+            ):
+                return Gamma
+        raise RuntimeError(
+            "Initial Gamma rejection exceeded max_cycle_rejection_attempts; "
+            "decrease gamma or increase the attempt limit"
+        )
     else:
         Gamma = np.asarray(Gamma)
         if Gamma.shape != expected_shape:
@@ -2288,6 +2477,13 @@ def update_Gamma(
             )
         if not np.all((Gamma == 0) | (Gamma == 1)):
             raise ValueError("Gamma may contain only 0 and 1")
+        if max_cycle_length and _has_forbidden_directed_cycle(Gamma, max_cycle_length):
+            raise ValueError(
+                "Initial Gamma contains a forbidden directed cycle; "
+                "start from a compatible state or one initial species"
+            )
+        if max_cycle_length and gamma == 1 and active_count:
+            raise ValueError("gamma=1 cannot introduce a species without a directed 2-cycle")
 
     # uint8 uses one byte per edge and is sufficient for this binary matrix.
     new_size = active_count + 1
@@ -2296,14 +2492,26 @@ def update_Gamma(
 
     # Draw both directed links with every already-existing species. The paper
     # does not define a self-interaction; it is dynamically irrelevant and 0.
-    new_edges = random_source.random(2 * active_count) < gamma
-    new_Gamma[-1, :-1] = new_edges[:active_count]
-    new_Gamma[:-1, -1] = new_edges[active_count:]
-    new_Gamma[-1, -1] = 0
-
-    if invaded_species not in (None, 0):
-        invaded_index = live_species.index(invaded_species)
-        new_Gamma[-1, invaded_index] = 1
+    active_slots = np.arange(active_count, dtype=np.int32)
+    invaded_index = (
+        live_species.index(invaded_species) if invaded_species not in (None, 0) else -1
+    )
+    for attempt in range(max_cycle_rejection_attempts):
+        new_edges = random_source.random(2 * active_count) < gamma
+        new_Gamma[-1, :-1] = new_edges[:active_count]
+        new_Gamma[:-1, -1] = new_edges[active_count:]
+        new_Gamma[-1, -1] = 0
+        if invaded_index >= 0:
+            new_Gamma[-1, invaded_index] = 1
+        if not max_cycle_length or not _new_species_closes_forbidden_cycle(
+            new_Gamma, active_slots, active_count, active_count, max_cycle_length
+        ):
+            break
+    else:
+        raise RuntimeError(
+            "Species introduction rejection exceeded max_cycle_rejection_attempts; "
+            "decrease gamma or increase the attempt limit"
+        )
 
     live_species.append(new_species)
     newest_species = new_species
@@ -2421,6 +2629,8 @@ def _run_compiled_simulation(
     forced_introduction_timesteps,
     timesteps,
     track_every,
+    max_forbidden_cycle_length=0,
+    max_cycle_rejection_attempts=1_000_000,
 ):
     """Execute sequential stochastic updates in compiled machine code."""
     total_sites = slot_lattice.size
@@ -2525,18 +2735,34 @@ def _run_compiled_simulation(
                 slot_species_ids[new_slot] = newest_species
                 species_counts[new_slot] = 1
 
-                # Draw the new directed relationships independently. Existing
-                # relationships are never regenerated or altered.
-                for position in range(live_count):
-                    other_slot = active_slots[position]
-                    Gamma[new_slot, other_slot] = rng.random() < gamma
-                Gamma[new_slot, new_slot] = 0
-                for position in range(live_count):
-                    other_slot = active_slots[position]
-                    Gamma[other_slot, new_slot] = rng.random() < gamma
+                # Draw all candidate relationships in the model's original
+                # order. With the optional restriction, reject the whole
+                # candidate and retry at the same gamma. Existing edges and
+                # the introduction site stay fixed throughout these retries.
+                attempts = 0
+                while True:
+                    for position in range(live_count):
+                        other_slot = active_slots[position]
+                        Gamma[new_slot, other_slot] = rng.random() < gamma
+                    Gamma[new_slot, new_slot] = 0
+                    for position in range(live_count):
+                        other_slot = active_slots[position]
+                        Gamma[other_slot, new_slot] = rng.random() < gamma
 
-                if replaced_slot >= 0:
-                    Gamma[new_slot, replaced_slot] = 1
+                    if replaced_slot >= 0:
+                        Gamma[new_slot, replaced_slot] = 1
+                    if not max_forbidden_cycle_length or not _new_species_closes_forbidden_cycle(
+                        Gamma, active_slots, live_count, new_slot,
+                        max_forbidden_cycle_length,
+                    ):
+                        break
+                    attempts += 1
+                    if attempts >= max_cycle_rejection_attempts:
+                        raise RuntimeError(
+                            "Species introduction rejection exceeded "
+                            "max_cycle_rejection_attempts; decrease gamma "
+                            "or increase the attempt limit"
+                        )
 
                 active_slots[live_count] = new_slot
                 slot_to_active_position[new_slot] = live_count
@@ -2642,9 +2868,22 @@ def _simulate_lattice(
     retention=None,
     target_timestep=None,
     geometry_metadata=None,
+    max_forbidden_cycle_length=None,
+    max_cycle_rejection_attempts=1_000_000,
 ):
     """Prepare state and run the exact sequential model in compiled code."""
-    geometry_metadata = {} if geometry_metadata is None else geometry_metadata
+    cycle_limit = _validate_cycle_rejection_options(
+        max_forbidden_cycle_length, max_cycle_rejection_attempts
+    )
+    cycle_options = {
+        "max_forbidden_cycle_length": cycle_limit,
+        "max_cycle_rejection_attempts": int(max_cycle_rejection_attempts),
+    } if cycle_limit else {}
+    geometry_metadata = {
+        **({} if geometry_metadata is None else geometry_metadata),
+        "max_forbidden_cycle_length": cycle_limit or None,
+        "max_cycle_rejection_attempts": int(max_cycle_rejection_attempts),
+    }
     if not _NUMBA_AVAILABLE:
         raise ImportError(
             "Fast simulations require numba; install it with 'pip install numba'"
@@ -2658,14 +2897,21 @@ def _simulate_lattice(
             newest_species,
             invaded_species=None,
             rng=rng,
+            **cycle_options,
         )
     else:
         initial_Gamma = np.asarray(initial_Gamma, dtype=np.uint8)
+        if cycle_limit and _has_forbidden_directed_cycle(initial_Gamma, cycle_limit):
+            raise ValueError("initial Gamma contains a forbidden directed cycle")
 
     rows, columns = lattice.shape
     total_sites = lattice.size
     external_flat = lattice.ravel()
     usable_sites = np.flatnonzero(external_flat != -1).astype(np.intp)
+    if cycle_limit and gamma == 1 and usable_sites.size and T and (
+        alpha > 0 or (populate_first_100 and initial_timestep < 100)
+    ):
+        raise ValueError("gamma=1 cannot support repeated introductions without forbidden cycles")
     introduction_probability = alpha * gamma / total_sites
     if usable_sites.size == 0:
         introduction_probability = 0.0
@@ -2858,6 +3104,7 @@ def _simulate_lattice(
                 forced_introduction_timesteps,
                 int(T),
                 int(track_every),
+                **cycle_options,
             )
             state = result[:-1]
             diversity_history[recorded_samples:] = result[-1]
@@ -2891,6 +3138,7 @@ def _simulate_lattice(
                     min(forced_introduction_timesteps, chunk_size),
                     chunk_size,
                     int(track_every),
+                    **cycle_options,
                 )
                 state = result[:-1]
                 next_recorded_samples = recorded_samples + result[-1].size
@@ -3053,6 +3301,8 @@ def simulation_from_state(
     retention=None,
     target_timestep=None,
     continue_history=None,
+    max_forbidden_cycle_length=None,
+    max_cycle_rejection_attempts=None,
 ):
     """Run ``T`` additional time units from a result or saved checkpoint.
 
@@ -3074,6 +3324,11 @@ def simulation_from_state(
     )
     _validate_gamma(gamma)
     state = _normalize_initial_state(initial_state)
+    if max_forbidden_cycle_length is None:
+        max_forbidden_cycle_length = state.get("max_forbidden_cycle_length")
+    if max_cycle_rejection_attempts is None:
+        max_cycle_rejection_attempts = state.get("max_cycle_rejection_attempts", 1_000_000)
+    _validate_cycle_rejection_options(max_forbidden_cycle_length, max_cycle_rejection_attempts)
     pruning_source = state.get("_cluster_pruning_source_directory")
     if pruning_source is not None and checkpoint_dir is not None and _same_directory(
         pruning_source, checkpoint_dir
@@ -3114,6 +3369,8 @@ def simulation_from_state(
         retention=retention,
         target_timestep=target_timestep,
         geometry_metadata=_percolation_metadata(state),
+        max_forbidden_cycle_length=max_forbidden_cycle_length,
+        max_cycle_rejection_attempts=max_cycle_rejection_attempts,
     )
     if checkpoint_dir is None and pruning_source is not None:
         result["_cluster_pruning_source_directory"] = pruning_source
@@ -3135,6 +3392,8 @@ def main_simulation(
     checkpoint_dir=None,
     retention=None,
     continue_history=None,
+    max_forbidden_cycle_length=None,
+    max_cycle_rejection_attempts=1_000_000,
 ):
     """Run the spatial invasion simulation.
 
@@ -3161,6 +3420,7 @@ def main_simulation(
         alpha, T, track_every, progress, populate_first_100
     )
     _validate_gamma(gamma)
+    _validate_cycle_rejection_options(max_forbidden_cycle_length, max_cycle_rejection_attempts)
     if initial_state is not None:
         return simulation_from_state(
             initial_state,
@@ -3174,6 +3434,8 @@ def main_simulation(
             checkpoint_dir=checkpoint_dir,
             retention=retention,
             continue_history=continue_history,
+            max_forbidden_cycle_length=max_forbidden_cycle_length,
+            max_cycle_rejection_attempts=max_cycle_rejection_attempts,
         )
 
     rng = _make_rng(seed)
@@ -3193,6 +3455,8 @@ def main_simulation(
         populate_first_100,
         checkpoint_dir=checkpoint_dir,
         retention=retention,
+        max_forbidden_cycle_length=max_forbidden_cycle_length,
+        max_cycle_rejection_attempts=max_cycle_rejection_attempts,
     )
 
 
@@ -3304,6 +3568,8 @@ def percolation_simulation(
     retention=None,
     continue_history=None,
     largest_cluster_only=True,
+    max_forbidden_cycle_length=None,
+    max_cycle_rejection_attempts=1_000_000,
 ):
     """Run the simulation with permanent random site removal.
 
@@ -3320,6 +3586,7 @@ def percolation_simulation(
         alpha, T, track_every, progress, populate_first_100
     )
     _validate_gamma(gamma)
+    _validate_cycle_rejection_options(max_forbidden_cycle_length, max_cycle_rejection_attempts)
     if (
         isinstance(p, (bool, np.bool_))
         or not isinstance(p, (int, float, np.integer, np.floating))
@@ -3376,6 +3643,8 @@ def percolation_simulation(
             checkpoint_dir=checkpoint_dir,
             retention=retention,
             continue_history=continue_history,
+            max_forbidden_cycle_length=max_forbidden_cycle_length,
+            max_cycle_rejection_attempts=max_cycle_rejection_attempts,
         )
 
     # Reuse create_lattice for input validation without consuming randomness.
@@ -3443,6 +3712,8 @@ def percolation_simulation(
         checkpoint_dir=checkpoint_dir,
         retention=retention,
         geometry_metadata=geometry_metadata,
+        max_forbidden_cycle_length=max_forbidden_cycle_length,
+        max_cycle_rejection_attempts=max_cycle_rejection_attempts,
     )
     return result
 

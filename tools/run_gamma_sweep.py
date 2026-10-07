@@ -142,7 +142,7 @@ def prepare_resume(args):
         else:
             timestep = int(summary["start_timestep"])
             status = "not_started"
-            needs_initial_state = True
+            needs_initial_state = plan.get("initial_state") is not None
         statuses.append({
             "job_index": metadata["job_index"], "gamma": metadata["config"]["gamma"],
             "repeat": metadata["repeat_index"] + 1, "status": status,
@@ -277,10 +277,10 @@ def main(argv=None):
     return 0
 
 
-def print_pause_command(output_root):
+def print_pause_command(output_root, script="tools/run_gamma_sweep.py"):
     print("\nSweep stopped. Saved checkpoints are retained; unfinished chunks will be repeated.",
           flush=True)
-    print(f'Resume: python tools/run_gamma_sweep.py --resume "{output_root}"', flush=True)
+    print(f'Resume: python {script} --resume "{output_root}"', flush=True)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,8 @@ config = MS.SimulationConfig(
 | `progress` | Show a progress bar. |
 | `p` | Blocked-site probability for a new percolation lattice. |
 | `largest_cluster_only` | Keep only the largest periodic four-neighbour usable cluster at initialization; defaults to `True` for percolation. |
+| `max_forbidden_cycle_length` | Reject directed cycles of lengths 2 through this inclusive bound; `None` keeps ordinary introductions. Use `6` for the new experiment. |
+| `max_cycle_rejection_attempts` | Maximum proposals per introduction or initial Gamma; defaults to 1,000,000. Exhaustion raises an error without accepting an invalid proposal. |
 | `populate_first_100` | Force one introduction during each of the first 100 time units. |
 | `checkpoint_dir` | Snapshot folder; `None` disables checkpointing. |
 | `retention` | Which snapshots survive; `None` uses the default policy. |
@@ -240,6 +242,57 @@ The general notebook API is `MS.resume_simulations(checkpoint_root,
 max_workers=4, initial_state=original_shared_state)`. The starting state is
 needed only for branched jobs without a checkpoint; the sweep command supplies
 it automatically.
+
+## Percolation without short directed cycles
+
+Set `max_forbidden_cycle_length=6` to exclude directed cycles of lengths
+**2 through 6 inclusive**. When a new species arrives, the simulation draws
+all its outgoing links and then all its incoming links with the requested
+gamma, and applies the model's forced outgoing link to the replaced species.
+If those links create a forbidden cycle, the entire new row and column are
+drawn again. The introduction keeps its site and existing species connections;
+the lattice is updated only after accepting a valid proposal.
+
+The check uses a bounded breadth-first search over living species. A new
+outgoing link, an old path of at most four edges, and a new incoming link
+would close a cycle of at most six edges. Empty paths detect reciprocal
+two-species cycles. Dead/reused matrix slots do not participate. Extinctions
+and microscopic updates retain the ordinary sequential order. With the option
+disabled, the original seeded trajectories and RNG states are preserved.
+
+Fresh initial Gamma matrices also obey the restriction. Existing states with
+forbidden cycles are rejected rather than silently editing their interactions.
+Cycle settings are saved in checkpoints, analysis records and batch plans;
+resuming a batch restores the same rule and random stream. Generic continuation
+inherits the saved restriction and rejection limit when they are omitted.
+
+**Cell 11, the last cell in `sim_notebook.ipynb`, is ready to run on the
+32-core / 200 GB machine.** It starts fresh with one species per lattice,
+200x200 sites, `p=0.05`, largest-cluster filtering, `alpha=0.0125`,
+`T=50_000_000`, and tracking every 10,000 model time units. All 12 earlier
+gamma values, including `0.12`, have two repeats: **24 independent CPU
+workers and 24 runs**. Each run has its own seed, fresh history and checkpoint
+folder. `BASE_SEED=67` reproduces the batch; change it for another batch.
+
+The cell prints its unique sweep folder before launching. Interrupt the cell
+to stop the workers. Set `RESUME_ROOT` to that existing folder and rerun
+cell 11 to continue the same sweep; completed runs are skipped. The cell is
+deliberately unexecuted in the saved notebook.
+
+An equivalent standalone runner is available:
+
+```powershell
+.\MSvenv\Scripts\python.exe tools/run_no_short_cycles_sweep.py --workers 24 --dry-run
+.\MSvenv\Scripts\python.exe tools/run_no_short_cycles_sweep.py --workers 24
+.\MSvenv\Scripts\python.exe tools/run_no_short_cycles_sweep.py --resume checkpoints/YOUR_SWEEP_FOLDER --workers 24
+```
+
+This restriction still permits cycles of length **7 and above**. It therefore
+does not remove every possible cycle or guarantee pure noise. Gamma is the
+**proposal** link probability: conditioning on the absence of short cycles
+changes the accepted networks' edge density and correlations. Rejections can
+also increase runtime as diversity grows; the attempt limit fails clearly
+instead of changing the rule or skipping an introduction.
 
 ## Performance and reproducibility
 
