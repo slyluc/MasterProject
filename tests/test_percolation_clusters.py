@@ -467,7 +467,7 @@ class LargestClusterSimulationTests(unittest.TestCase):
                 self.assertTrue(metadata["forked_rng"])
                 folder = Path(metadata["checkpoint_dir"])
                 folders.append(folder)
-                self.assertEqual(folder.parent, root)
+                self.assertEqual(folder.parent, root.resolve())
                 saved = MS.load_checkpoint(folder)
                 analysis = MS.load_analysis(folder)
                 for run in (result, saved, analysis):

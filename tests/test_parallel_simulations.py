@@ -103,7 +103,7 @@ class ParallelSimulationTests(unittest.TestCase):
             self.assertEqual(len(set(directories)), 4)
             self.assertEqual(len(plan["jobs"]), 4)
             for index, (directory, result) in enumerate(zip(directories, results)):
-                self.assertEqual(directory.parent, root)
+                self.assertEqual(directory.parent, root.resolve())
                 self.assertEqual(plan["jobs"][index]["seed"], result["batch_metadata"]["seed"])
                 self.assertEqual(plan["jobs"][index]["config"]["T"], 2)
                 saved = MS.load_checkpoint(directory)
