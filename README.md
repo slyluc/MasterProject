@@ -616,9 +616,23 @@ with it (lattice, Gamma, species and random-number state), and the render
 stops if one differs. Nothing but the video is written, and the render stops
 if the output drive falls below `--min-free-gb` (default 20).
 
+Species colours follow their IDs by default, so species close in age can look
+alike. `--age-colours` instead colours by age. It ranks every species seen in
+the video's window by ID, which is arrival order. Hue runs evenly along a
+rainbow, from violet for the oldest through blue, green, yellow and red to pink
+for the newest. Lightness cycles dark, plain, light along the same order, so
+species next to each other in age never look alike. A strip above the curves
+shows every species' colour, oldest to newest.
+
+`--highlight` takes species IDs. Those species keep their plain colour at full
+strength, and every other species is faded towards light grey. A recoloured
+video gets `_age` and/or `_highlight_<IDs>` added to its name, so it never
+replaces a plain one.
+
 ```powershell
 .\MSvenv\Scripts\python.exe tools/render_switch_videos.py
 .\MSvenv\Scripts\python.exe tools/render_switch_videos.py --every-step 153.9515 154.5 155
+.\MSvenv\Scripts\python.exe tools/render_switch_videos.py --every-step 153.9515 --age-colours --highlight 57538 57627 57632
 .\MSvenv\Scripts\python.exe tools/render_switch_videos.py --every-step 154.5 --max-frames 60
 ```
 

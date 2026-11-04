@@ -13,10 +13,17 @@ Each frame shows the lattice, living species and patches with a cursor at the fr
 frame's numbers, and a map of the sites a neighbour could invade at that moment and of the
 youngest species.
 
+Species colours follow their IDs by default. --age-colours instead orders the video's species by
+age (IDs rise with arrival) along a rainbow from violet (oldest) through blue, green, yellow and
+red to pink (newest), with lightness cycling over three levels so species of neighbouring ages
+never look alike. --highlight keeps the given species in full colour and mutes all others.
+
 Needs imageio-ffmpeg for its bundled ffmpeg: pip install imageio-ffmpeg
 
 Sampled:     python tools/render_switch_videos.py
 Every step:  python tools/render_switch_videos.py --every-step 153.9515 154.5 155
+Highlighted: python tools/render_switch_videos.py --every-step 153.9515 --age-colours
+             --highlight 57538 57627 57632
 Test:        python tools/render_switch_videos.py --every-step 154.5 --max-frames 60
 """
 
@@ -29,6 +36,7 @@ import sys
 
 import matplotlib
 matplotlib.use("Agg")
+from matplotlib.colors import hsv_to_rgb  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
@@ -51,6 +59,15 @@ INK, BAND_COLOR, SURFACE = "#52514e", "#ecebe6", "#fcfcfb"
 INVADABLE_COLOR = np.array([0.89, 0.29, 0.28])  # #e34948
 NEWCOMER_COLOR = np.array([0.165, 0.47, 0.84])  # #2a78d6
 USABLE_COLOR = np.array([0.88, 0.88, 0.86])
+# Age colours: a rainbow of HSV hues from violet (oldest) through blue, green, yellow and red on
+# to pink (newest). Going past red keeps the newest species apart; turbo, for one, crowds them
+# into similar dark reds. The three lightness levels alternate between neighbouring ages, and
+# --highlight mutes the other species towards a light grey.
+AGE_HUES = (0.72, -0.12)
+AGE_SATURATION, AGE_VALUE = 0.9, 0.95
+DARKER, LIGHTER = 0.55, 0.5
+MUTED_KEEP, MUTED_TOWARDS = 0.4, np.array([0.9, 0.9, 0.88])
+EMPTY_COLOR = np.array([0.92, 0.92, 0.92])  # As in MS._lattice_rgba.
 STATE_KEYS = ("lattice", "Gamma", "current_species", "newest_species", "timestep", "rng_state")
 
 
@@ -74,6 +91,10 @@ def parse_args(argv=None):
     parser.add_argument("--max-frames", type=int, help="stop after this many frames, for a test")
     parser.add_argument("--min-free-gb", type=float, default=20.0,
                         help="refuse to start, or stop, below this much free space (default: 20)")
+    parser.add_argument("--age-colours", action="store_true",
+                        help="colour species by age, oldest violet to newest pink")
+    parser.add_argument("--highlight", type=int, nargs="+", metavar="SPECIES",
+                        help="keep these species in full colour and mute all others")
     return parser.parse_args(argv)
 
 
@@ -96,9 +117,53 @@ def invadable_sites(row, Gamma):
     return target
 
 
-def species_color(species):
-    """The colour sim_modules._lattice_rgba gives a species ID."""
-    return plt.colormaps["hsv"](np.remainder(species * 0.61803398875, 1.0))
+def age_palette(species):
+    """Sorted species IDs, their colours by age, and their plain colours: IDs rise with arrival,
+    so the oldest come first.
+
+    Hue runs from the oldest species (violet) to the newest (pink), evenly by age rank.
+    Lightness cycles dark, plain, light along the same order, so species next to each other in
+    age differ clearly even when their hues are close. Highlighted species use the plain colour
+    of their hue, at full strength.
+    """
+    ids = np.unique(np.asarray(species, dtype=np.int64))
+    hues = np.mod(np.linspace(*AGE_HUES, max(ids.size, 2))[:ids.size], 1.0)
+    base = hsv_to_rgb(np.column_stack([hues, np.full(ids.size, AGE_SATURATION),
+                                       np.full(ids.size, AGE_VALUE)]))
+    level = (np.arange(ids.size) % 3)[:, None]
+    colours = np.where(level == 0, base * DARKER,
+                       np.where(level == 2, base + (1 - base) * LIGHTER, base))
+    return ids, colours, base
+
+
+def mute(colours):
+    """Colours faded towards a light grey, for species that are not highlighted."""
+    return MUTED_KEEP * np.asarray(colours) + (1 - MUTED_KEEP) * MUTED_TOWARDS
+
+
+def lattice_colours(lattice, palette=None, highlight=None):
+    """RGB image of a lattice: by species ID, or by a palette from age_palette, with every
+    species outside highlight muted."""
+    if palette is None:
+        rgb = MS._lattice_rgba(lattice)[..., :3]
+    else:
+        ids, colours, plain = palette
+        if highlight is not None:
+            colours = np.where(np.isin(ids, highlight)[:, None], plain, colours)
+        rgb = np.empty(lattice.shape + (3,))
+        rgb[...] = EMPTY_COLOR
+        rgb[lattice < 0] = 0.0
+        occupied = lattice > 0
+        rgb[occupied] = colours[np.searchsorted(ids, lattice[occupied])]
+    if highlight is not None:
+        faded = (lattice > 0) & ~np.isin(lattice, highlight)
+        rgb[faded] = mute(rgb[faded])
+    return rgb
+
+
+def colour_of(species, palette=None, highlight=None):
+    """The colour one species has in lattice_colours."""
+    return lattice_colours(np.array([[species]]), palette, highlight)[0, 0]
 
 
 class Capture:
@@ -177,8 +242,12 @@ def replay(capture, first, last):
             yield state
 
 
-def build_figure(capture, title, subtitle, trace, newcomer_age):
-    """The static parts of a frame, and the artists each frame updates."""
+def build_figure(capture, title, subtitle, trace, newcomer_age, palette=None, highlight=None):
+    """The static parts of a frame, and the artists each frame updates.
+
+    With an age palette, a strip of every species' colour, oldest to newest, sits above the
+    trace, and highlighted species are named on it.
+    """
     fig = plt.figure(figsize=(SIZE[0] / 100, SIZE[1] / 100), dpi=100, facecolor="white")
     side = 0.94 * SIZE[1] / SIZE[0]  # Square lattice in figure-width units.
     # Images start at the lattice's shape, so their extent fits every later frame.
@@ -190,7 +259,25 @@ def build_figure(capture, title, subtitle, trace, newcomer_age):
     fig.text(right, 0.965, title, fontsize=15, fontweight="bold", color="#1a1a19", va="top")
     fig.text(right, 0.925, subtitle, fontsize=10, color=INK, va="top")
 
-    ax_trace = fig.add_axes([right + 0.04, 0.575, 0.93 - right - 0.04, 0.29])
+    trace_height = 0.29
+    if palette is not None:
+        trace_height = 0.255  # Room for the age strip above the trace.
+        ids = palette[0]
+        ax_strip = fig.add_axes([right + 0.04, 0.858, 0.93 - right - 0.04, 0.018])
+        ax_strip.imshow(lattice_colours(ids[None, :], palette, highlight), aspect="auto",
+                        interpolation="nearest")
+        ax_strip.set_axis_off()
+        fig.text(right + 0.036, 0.867, "oldest", fontsize=9, color=INK, ha="right", va="center")
+        fig.text(0.934, 0.867, "newest", fontsize=9, color=INK, ha="left", va="center")
+        named = sorted(int(np.searchsorted(ids, species)) for species in
+                       (highlight if highlight is not None else ()) if species in ids)
+        for order, column in enumerate(named):
+            # Alternate above and below the strip, so neighbouring names do not overlap.
+            above = order % 2 == 0
+            ax_strip.text(column, -0.7 if above else 0.7, str(ids[column]), fontsize=8.5,
+                          fontweight="bold", color="#1a1a19", ha="center",
+                          va="bottom" if above else "top", clip_on=False)
+    ax_trace = fig.add_axes([right + 0.04, 0.575, 0.93 - right - 0.04, trace_height])
     ax_trace.set_facecolor(SURFACE)
     for spine in ("top", "right"):
         ax_trace.spines[spine].set_visible(False)
@@ -256,11 +343,12 @@ def build_figure(capture, title, subtitle, trace, newcomer_age):
     return fig, moving
 
 
-def encode(fig, art, frames, out, fps, newcomer_age, min_free_gb):
+def encode(fig, art, frames, out, fps, newcomer_age, min_free_gb, palette=None, highlight=None):
     """Draw each frame description into the figure and pipe it to ffmpeg; return the count.
 
     A frame description holds the state (lattice, Gamma, current_species), the cursor position,
-    the information text, and the arrival time of each living species.
+    the information text, and the arrival time of each living species. The lattice is coloured
+    by lattice_colours with the given palette and highlight.
     """
     import imageio_ffmpeg
 
@@ -279,7 +367,7 @@ def encode(fig, art, frames, out, fps, newcomer_age, min_free_gb):
         for frame in frames:
             lattice, Gamma = frame["lattice"], np.asarray(frame["Gamma"]).astype(bool)
             species = np.asarray(frame["current_species"], dtype=np.int64)
-            art["image"].set_data(MS._lattice_rgba(lattice)[..., :3])
+            art["image"].set_data(lattice_colours(lattice, palette, highlight))
             row = site_rows(lattice, species)
             invadable = invadable_sites(row, Gamma)
             newcomer = frame["arrivals"] > frame["timestep"] - newcomer_age
@@ -292,7 +380,7 @@ def encode(fig, art, frames, out, fps, newcomer_age, min_free_gb):
             art["info"].set_text(frame["info"])
             held = np.bincount(row[row >= 0], minlength=species.size)
             top = int(np.argmax(held))
-            art["swatch"].set_color(species_color(species[top]))
+            art["swatch"].set_color(colour_of(species[top], palette, highlight))
             arrived = frame["arrivals"][top]
             since = (f"arrived by t = {arrived:,}" if arrived >= 0
                      else "arrived before the capture")
@@ -343,9 +431,13 @@ def sampled_video(capture, name, args):
                 f"cycles 2-{settings['max_forbidden_cycle_length']} rejected · one frame every "
                 f"{capture.track:,} steps")
     newcomer_age = 20_000
-    fig, art = build_figure(capture, f"{name}: t = {t_m[lo]:.2f}M to {t_m[hi]:.2f}M",
-                            subtitle, trace, newcomer_age)
     features = capture.features
+    palette = None
+    if args.age_colours:  # Every species alive in some frame of the window.
+        offsets = features["offsets"]
+        palette = age_palette(features["species_id"][offsets[lo]:offsets[hi + 1]])
+    fig, art = build_figure(capture, f"{name}: t = {t_m[lo]:.2f}M to {t_m[hi]:.2f}M",
+                            subtitle, trace, newcomer_age, palette, args.highlight)
 
     def frames():
         for frame, index in enumerate(range(lo, hi + 1), 1):
@@ -361,7 +453,7 @@ def sampled_video(capture, name, args):
             yield {**state, "cursor": t_m[index], "info": info,
                    "arrivals": capture.arrivals(state["current_species"])}
 
-    return fig, art, frames(), newcomer_age
+    return fig, art, frames(), newcomer_age, palette
 
 
 def step_video(capture, centre, args):
@@ -374,6 +466,7 @@ def step_video(capture, centre, args):
     lead = first - newcomer_age  # Replay this far back, so newcomers' exact arrivals are known.
     measures = {key: [] for key in ("timestep", "species", "patches", "largest", "single")}
     exact = {}  # Species ID -> the step it arrived in, for arrivals seen in the replay.
+    seen = set()  # Every species alive in some frame, for the age palette.
     newest = None
     print(f"  measuring {lead:,} to {last:,}", flush=True)
     for state in replay(capture, lead, last):
@@ -382,6 +475,7 @@ def step_video(capture, centre, args):
                 exact[species] = state["timestep"]
         newest = state["newest_species"]
         if state["timestep"] >= first:
+            seen.update(state["current_species"].tolist())
             measured = switch_features.features_of(state["lattice"], state["Gamma"],
                                                    state["current_species"],
                                                    state["newest_species"], state["timestep"])
@@ -400,8 +494,9 @@ def step_video(capture, centre, args):
     subtitle = (f"p = {settings['p']:g}, α = {settings['alpha']:g}, γ = {settings['gamma']:g}, "
                 f"cycles 2-{settings['max_forbidden_cycle_length']} rejected · every step, "
                 f"replayed from the kept states")
+    palette = age_palette(sorted(seen)) if args.age_colours else None
     fig, art = build_figure(capture, f"Every step: t = {first:,} to {last - 1:,}", subtitle,
-                            trace, newcomer_age)
+                            trace, newcomer_age, palette, args.highlight)
 
     def frames():
         previous = None
@@ -422,7 +517,7 @@ def step_video(capture, centre, args):
                        else "no new species this step"))
             yield {**state, "cursor": offset[frame], "info": info, "arrivals": arrivals}
 
-    return fig, art, frames(), newcomer_age
+    return fig, art, frames(), newcomer_age, palette
 
 
 def main(argv=None):
@@ -440,14 +535,18 @@ def main(argv=None):
         names = ("Rise", "Collapse") if args.window == "both" else (args.window.title(),)
         jobs = [(name.lower(), name) for name in names]
         fps = args.fps or 30
+    # Recoloured videos get their own names, so they never replace the plain ones.
+    suffix = ("_age" if args.age_colours else "") + (
+        "_highlight_" + "_".join(map(str, sorted(args.highlight))) if args.highlight else "")
     for stem, what in jobs:
+        stem += suffix
         out = out_dir / f"{stem}.mp4"
         print(f"{stem} -> {out}", flush=True)
         if args.every_step:
-            fig, art, frames, age = step_video(capture, what, args)
+            fig, art, frames, age, palette = step_video(capture, what, args)
         else:
-            fig, art, frames, age = sampled_video(capture, what, args)
-        count = encode(fig, art, frames, out, fps, age, args.min_free_gb)
+            fig, art, frames, age, palette = sampled_video(capture, what, args)
+        count = encode(fig, art, frames, out, fps, age, args.min_free_gb, palette, args.highlight)
         print(f"{stem}: {count:,} frames, {count / fps:.0f} s at {fps} fps, "
               f"{out.stat().st_size / 1e6:.0f} MB", flush=True)
     return 0

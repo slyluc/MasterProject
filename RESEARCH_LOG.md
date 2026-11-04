@@ -391,6 +391,40 @@ do in the paper?
   tests pass.
 - This log was started.
 
+#### 2026-11-04 14:08: the "wave" at t = 153,949,554 is a chain, not a 2-cycle (`session 2026-11-04`, every-step replay)
+- **Why (recorded):** in the rise videos, a newly introduced species seemed to move through another
+  species like a wave. That suggested a 2-cycle: two species that can each invade the other.
+- **Done:** replayed every step from t = 153,947,954 to 153,951,153 from the kept states. Every replayed
+  step that landed on a kept state matched it exactly. Γ was then read at 153,949,554.
+- **Result:**
+  - **No cycle at all:** none of the 28 living species can invade each other (no 2-cycles), and no
+    species lies on any directed cycle. Connectance is 0.032 (γ = 0.03).
+  - **The wave is a linear chain, 57627 → 57632 → 57538:**
+    - The newcomer 57632 arrived at 153,949,351 on 57538, which held 71% of the sites.
+    - 57632 invades 57538 through its forced link, and the older species 57627 invades 57632.
+    - 57627 cannot invade 57538, and 57538 cannot invade either of them.
+  - **The band:** 57632 is a band eaten from behind as it advances. It never held more than 4,331 sites
+    and was extinct by 153,950,025, 674 steps after it arrived.
+  - **The outcome:** 57627 went from 2,480 to 21,564 sites (78%). 57538 fell from 19,422 to 355 sites,
+    which survive as 62 islands (16 before). Total patches went from 237 to 285.
+  - **Consequence for the rise:** this relay made 57627 dominant. The next relay
+    (57563 → 57633 → 57627, from 153,951,020) broke 57627 up in turn. The rise therefore starts with two
+    back-to-back chain relays, each leaving islands of the species it passes over.
+- **Why 2-cycles cannot occur here:** the newcomer's forced link to the species it lands on is set
+  before the short-cycle check (`sim_modules.py`, introduction step). A newcomer whose prey could invade
+  it back would be redrawn, so in these runs any travelling band is a chain, or a cycle of length ≥ 7.
+- **Follow-up, 14:43: a re-render coloured by age**
+  (`videos/steps_000153951500_age_highlight_57538_57627_57632.mp4`).
+  - **Why (recorded):** with colours set by species ID, species could look alike. The request was a
+    gradient that follows age, older on the left and newer on the right, with the three species above
+    standing out.
+  - **Colours:** hue runs from violet (oldest) to pink (newest), and lightness cycles over three levels
+    so species of neighbouring ages differ.
+  - **Highlighting:** 57538 (cyan), 57627 (red) and 57632 (magenta) are drawn at full colour, and all
+    other species are faded.
+  - **What it shows:** the magenta band moves through the cyan with red close behind. It is visible
+    from 0:24 to 0:35.
+
 ---
 
 ## 2. Register of discoveries
@@ -409,7 +443,7 @@ do in the paper?
 | D10 | The diverse state is a flow of newcomers, not a stable assembly: no species alive at a branch survives 100M, and 73% of peak species are under 1M steps old | Established (all branches) + Observed (capture) | 23 Oct / 31 Oct | `nb sim_analysis §9`, `nb switch_analysis §7` |
 | D11 | The rise starts with the break-up of the dominant patch (patchiness first) | Observed (1 rise) | 31 Oct | `nb switch_analysis §3, §5` |
 | D12 | Newcomers establish more often on a fragmented lattice (39% against 14%) | Observed (1 capture, many newcomers) | 31 Oct | `nb switch_analysis §5` |
-| D13 | Without short cycles, patches form by linear chain relays whose follower cannot invade the original species; collapses are relays that erase islands | Observed (4 events) | 31 Oct | every-step videos |
+| D13 | Without short cycles, patches form by linear chain relays whose follower cannot invade the original species; collapses are relays that erase islands. Travelling bands in the videos are such chains, not 2-cycles | Observed (5 events) | 31 Oct; 4 Nov | every-step videos; replay at 153,949,554 |
 | D14 | Cycles in Γ track the species count (a large cycle-connected group appears near S ≈ 1/γ), and about 80% of states are frozen, so cycles in Γ are rarely active on the lattice | Observed (1 capture) | 31 Oct | `nb switch_analysis §6` |
 | D15 | The cost of rejecting short cycles explodes with γ and species count (γ = 0.2 is unreachable at 99 species) | Observed (technical) | 22 Oct | `session 2026-10-22` |
 
@@ -423,7 +457,7 @@ on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their
 ## 3. Open questions and hypotheses
 
 - **Q1. What breaks up the dominant patch in a rise?**
-  - One rise shows a linear chain relay at 153.951M.
+  - One rise starts with two back-to-back linear chain relays: at 153.9494M and at 153.951M.
   - Is that the typical trigger? Answering this needs more rises, and an automated classifier for
     relay events: newcomer, follower, and whether the follower can invade the original species.
 - **Q2. Why do blocked sites replace short cycles?** *Hypothesis:*
