@@ -7,3 +7,6 @@ tqdm>=4.65,<5
 
 # Notebook plotting and analysis
 matplotlib>=3.7,<4
+
+# Optional MP4 export (bundles ffmpeg), used by tools/render_switch_videos.py
+imageio-ffmpeg>=0.5,<1

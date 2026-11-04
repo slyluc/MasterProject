@@ -266,7 +266,7 @@ Cycle settings are saved in checkpoints, analysis records and batch plans;
 resuming a batch restores the same rule and random stream. Generic continuation
 inherits the saved restriction and rejection limit when they are omitted.
 
-**Cell 11, the last cell in `sim_notebook.ipynb`, is ready to run on the
+**Cell 11, the last cell in `analysis/sim_notebook.ipynb`, is ready to run on the
 32-core / 200 GB machine.** It starts fresh with one species per lattice,
 200x200 sites, `p=0.05`, largest-cluster filtering, `alpha=0.0125`,
 `T=50_000_000`, and tracking every 10,000 model time units. All 12 earlier
@@ -545,6 +545,82 @@ changed = config.run_main(initial_state=state)
 
 Without `current_species`, Gamma rows are assumed to follow ascending positive
 species IDs in the lattice.
+
+### Capture one rise and one collapse at high resolution
+
+`tools/run_switch_capture.py` continues one run, keeps every state, and stops
+once the run has risen to the high regime and then fallen back. By default it
+continues the gamma = 0.03 control of the gamma swap in `analysis/sim_analysis.ipynb`
+(p = 0.3, alpha = 0.0125, largest cluster, directed cycles 2-6 rejected) from
+its last state at t = 150M, keeping a state every 1,000 steps on E:.
+
+```powershell
+.\MSvenv\Scripts\python.exe tools/run_switch_capture.py --dry-run
+.\MSvenv\Scripts\python.exe tools/run_switch_capture.py
+.\MSvenv\Scripts\python.exe tools/run_switch_capture.py --resume E:/MasterProject/checkpoints/YOUR_CAPTURE_FOLDER
+```
+
+The source's saved RNG is restored, so this is the control's own trajectory.
+Changing `track_every` and splitting the run into segments changes only how
+often it is recorded: the final lattice, Gamma and RNG state match one
+uninterrupted run. The run is written in segment folders of 1M steps (1,000
+states each). Every state stores its run's history so far, so one folder of
+1,000-step states would grow with the square of their number.
+
+The capture is judged by the notebook's regime rule: living species every
+10,000 steps, Gaussian-smoothed with a width of 0.2M steps, high from reaching
+50 until falling to 10. A switch counts once the run is 0.8M steps past it,
+when later samples can no longer move it. The capture stops `--after-down`
+steps (default 2M) after the first collapse that follows a rise.
+
+| Output | Contents |
+|---|---|
+| `capture_plan.json` | Source, settings and stop rule. |
+| `initial_state/` | A copy of the starting checkpoint. |
+| `segments/segment_NNNN_tSTART/` | Ordinary run folders: a checkpoint every 1,000 steps and `analysis.npz`. |
+| `series.npz` | Living species and patches of the whole capture, and the segment holding each sample. |
+| `progress.json` | Current time, regime, rise and collapse times, disk use. |
+
+Each kept state is about 340 KB, so 1M steps take about 0.34 GB and, on this
+PC, about 14 minutes. Ctrl+C pauses; resume repeats the unfinished interval
+with the same random sequence. `--max-steps` (default 200M) and
+`--min-free-gb` (default 20) stop the capture early. A resume may raise them,
+or `--after-down`, to continue it.
+
+`analysis/switch_analysis.ipynb` analyses a finished capture: living species
+and patches at full resolution, lattice snapshots around both switches, and
+measures of turnover, patch structure and the interaction network.
+`analysis/switch_features.py` computes those measures for every kept state
+in parallel (about 70 s for 18,631 states with 8 processes) and caches them
+in the capture folder as `features.npz`.
+
+The notebooks live in `analysis/`. Their first code cell changes to the
+project root, so `sim_modules` and relative `checkpoints/` paths resolve.
+
+`tools/render_switch_videos.py` renders the notebook's rise and collapse
+windows as MP4 videos in the capture's `videos/` folder, one frame per kept
+state at 30 frames per second (`--fps`), with `--before` and `--after`
+padding in millions of steps. Each frame shows the lattice, the living-species
+and patch curves with a cursor, and a map of the sites a neighbour could
+invade at that moment and of the species younger than 20,000 steps. It needs
+`imageio-ffmpeg` for its bundled ffmpeg. A sweep through a large patch takes
+less than 1,000 steps, so at that spacing it appears as one frame's change of
+colour rather than as a moving front.
+
+`--every-step` instead renders every single step: `--frames` steps (default
+7,200, two minutes at the default 60 frames per second) centred on each given
+time in millions of steps. The run is replayed in memory from the kept state
+before the window; the kept states hold the random-number state, so the replay
+is the run itself. Every replayed step that lands on a kept state is compared
+with it (lattice, Gamma, species and random-number state), and the render
+stops if one differs. Nothing but the video is written, and the render stops
+if the output drive falls below `--min-free-gb` (default 20).
+
+```powershell
+.\MSvenv\Scripts\python.exe tools/render_switch_videos.py
+.\MSvenv\Scripts\python.exe tools/render_switch_videos.py --every-step 153.9515 154.5 155
+.\MSvenv\Scripts\python.exe tools/render_switch_videos.py --every-step 154.5 --max-frames 60
+```
 
 ## Plot
 
