@@ -61,7 +61,10 @@ clusters are resolved by their first row-major site. This happens only before
 the run begins. Every model time unit still contains `L_row * L_col` attempts.
 Results, checkpoints and analysis records include `effective_p`,
 `original_usable_sites`, `usable_sites` and `removed_cluster_sites`.
-Set `largest_cluster_only=False` to reproduce the earlier removal rule.
+Set `largest_cluster_only=False` to reproduce the earlier removal rule. Such a
+run also counts the species that live in the cut-off pockets, and every pocket,
+even a single site, keeps one of its own. The September runs that had pockets
+were removed on 2026-11-05 (see `RESEARCH_LOG.md`).
 
 When starting from a checkpoint, its existing blocked mask is retained and
 `p` is not drawn again. Smaller usable components are removed if needed.
@@ -413,7 +416,19 @@ state = MS.load_checkpoint("checkpoints/base_run")
 state = MS.load_checkpoint(
     "checkpoints/base_run/checkpoint_000000010000.npz"
 )
+
+# A checkpoint that pruning removed, replayed from the newest one before it
+state = MS.recreate_checkpoint(
+    "checkpoints/gamma_07_alpha_0125/checkpoint_000050370000.npz"
+)
 ```
+
+`recreate_checkpoint` loads a snapshot that still exists. A removed one is
+replayed from the newest earlier snapshot in the same folder, with the random
+state saved there, so the lattice, Gamma, species, histories and random state
+equal what the run wrote. Replay runs at about 1,500 time units per second on a
+200x200 lattice, so a folder thinned to one snapshot per million is at most
+about ten minutes of replay from any of its snapshots.
 
 Resume a crashed run to its original target time:
 
@@ -469,33 +484,48 @@ config.retention = MS.RetentionPolicy(keep_all=True)   # keep every snapshot
 A snapshot is never deleted until its patch count is recorded, so a folder
 written before `analysis.npz` existed is left alone until it is migrated.
 
-### Shrinking existing runs
+### Thinning to one snapshot per million
 
-`tools/prune_checkpoints.py` applies the same policy to folders that already
-hold a full history. It counts the patches, writes `analysis.npz`, and then
-deletes the redundant snapshots. Without `--apply` it reports what it would
-delete and deletes nothing; it still writes the analysis record, because
-counting is the slow half of the job and saving the counts is what makes the
-later `--apply` pass instant:
+`tools/prune_checkpoints.py` thins finished runs further, to what replay needs.
+In every folder that holds snapshots (a run, each job of a batch, each segment
+of a switch capture) it keeps the first snapshot of each whole million time
+units, which is the one on the million when it exists, and the folder's newest
+snapshot, so the run still loads and resumes. Every other snapshot can be
+rebuilt with `MS.recreate_checkpoint`. All other files stay: analysis records,
+batch plans, capture series and features, and videos.
+
+Before a snapshot is left out, its patch count must be in the folder's
+`analysis.npz`. Missing counts are counted and recorded first, and a snapshot
+the record does not track is kept. The tool also replays from a kept snapshot
+to the next left-out one in every folder (`--verify N` checks per folder,
+default 1). The lattice, Gamma, species, histories and random state must all
+match exactly; a folder that fails is kept whole.
+
+Without `--apply` or `--into` it only reports. Quote the patterns, so the tool
+expands them rather than the shell; `cmd.exe` does no globbing and PowerShell
+does none for a native command:
 
 ```powershell
-python tools/prune_checkpoints.py checkpoints/gamma_07_alpha_0125
-python tools/prune_checkpoints.py checkpoints/gamma_07_alpha_0125 --apply
+python tools/prune_checkpoints.py "checkpoints/*"            # report only
+python tools/prune_checkpoints.py "checkpoints/*" --apply    # delete in place
 ```
 
-Several folders at once, quoting the pattern so the tool expands it rather
-than the shell. `cmd.exe` does no globbing and PowerShell does none for a
-native command, so an unquoted `checkpoints/*` reaches the tool as a literal
-string on Windows:
+`--into FOLDER` instead copies the given folders, thinned, into one folder and
+leaves the sources untouched. Lock files are not copied, and a rerun skips
+files already there. `--zip` then writes `FOLDER.zip` with the folder at its
+top, and tests every entry's checksum before naming it. To gather everything on
+one machine for another:
 
 ```powershell
-python tools/prune_checkpoints.py "checkpoints/*"
-python tools/prune_checkpoints.py "checkpoints/*" --apply
+python tools/prune_checkpoints.py "checkpoints/*" "E:/MasterProject/checkpoints/*" --into E:/MasterProject/export/checkpoints --zip
 ```
 
-The record is always written before anything is deleted, and rerunning the
-tool reuses the counts it already made. `--window`, `--smooth`, `--low` and
-`--high` override the policy defaults.
+Unzip the archive at the project root of the other machine, so the run folders
+land in its `checkpoints/`. `--every` changes the block size. On 2026-11-05,
+after the runs with cut-off pockets were removed, this kept 843 MB of the
+67.1 GB of snapshots, and all 146 replay checks matched. The copy, with records,
+plans, capture features and videos, holds 2,370 files (1.8 GB), and the zip is
+933 MB.
 
 ## Continue or change rules
 
@@ -592,7 +622,12 @@ and patches at full resolution, lattice snapshots around both switches, and
 measures of turnover, patch structure and the interaction network.
 `analysis/switch_features.py` computes those measures for every kept state
 in parallel (about 70 s for 18,631 states with 8 processes) and caches them
-in the capture folder as `features.npz`.
+in the capture folder as `features.npz`. Building that cache needs every
+state, so a capture thinned by `tools/prune_checkpoints.py` keeps its cache
+and refuses to rebuild it. `switch_features.states_at` gives the state at any
+tracked times: a kept state is loaded and any other is replayed from the kept
+state before it. In a thinned capture each replay is up to a million steps,
+about ten minutes, so the notebook cells that draw lattices take that long.
 
 The notebooks live in `analysis/`. Their first code cell changes to the
 project root, so `sim_modules` and relative `checkpoints/` paths resolve.
@@ -609,12 +644,20 @@ colour rather than as a moving front.
 
 `--every-step` instead renders every single step: `--frames` steps (default
 7,200, two minutes at the default 60 frames per second) centred on each given
-time in millions of steps. The run is replayed in memory from the kept state
-before the window; the kept states hold the random-number state, so the replay
-is the run itself. Every replayed step that lands on a kept state is compared
-with it (lattice, Gamma, species and random-number state), and the render
-stops if one differs. Nothing but the video is written, and the render stops
-if the output drive falls below `--min-free-gb` (default 20).
+time in millions of steps.
+
+Frames come from the kept states where they exist, and are otherwise replayed
+in memory from the newest kept state before them. The kept states hold the
+random-number state, so the replay is the run itself. Every kept state the
+replay reaches is compared with it (lattice, Gamma, species and random-number
+state), and the living species at every tracked sample with `features.npz`;
+the render stops if either differs. After the capture is thinned to one state
+per million steps, a window can start up to a million steps after the nearest
+kept state, about ten minutes of replay before the first frame. Nothing but
+the video is written, and the render stops if the output drive falls below
+`--min-free-gb` (default 20). Without `--capture`, the tool looks for the
+capture in the project's `checkpoints/` first and then in
+`E:\MasterProject\checkpoints`.
 
 Species colours follow their IDs by default, so species close in age can look
 alike. `--age-colours` instead colours by age. It ranks every species seen in

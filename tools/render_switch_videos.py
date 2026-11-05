@@ -2,12 +2,17 @@
 
 Two kinds of video:
 - Sampled (default): the rise and collapse windows of analysis/switch_analysis.ipynb
-  (switch_features.switch_points), padded on both sides, one frame per kept state (every 1,000
-  steps by default).
-- Every step (--every-step): --frames consecutive steps centred on each given time. The run is
-  replayed in memory from the saved state before the window. The saved states hold the random
-  number state, so the replay is the run itself; each replayed step that lands on a saved state
-  is checked against it, and the render stops if one ever differs. Only the video is written.
+  (switch_features.switch_points), padded on both sides, one frame per tracked sample (every
+  1,000 steps by default).
+- Every step (--every-step): --frames consecutive steps centred on each given time.
+
+Frames come from the saved states where the capture still keeps them, and are otherwise replayed
+in memory from the newest kept state before them. The saved states hold the random number state,
+so the replay is the run itself. Every kept state the replay reaches is checked against it, and
+the living species at every tracked sample against features.npz; the render stops if either ever
+differs. Once tools/prune_checkpoints.py has thinned the capture to one state per million steps,
+a window can start up to a million steps after the nearest kept state: about ten minutes of
+replay before the first frame. Only the video is written.
 
 Each frame shows the lattice, living species and patches with a cursor at the frame's time, the
 frame's numbers, and a map of the sites a neighbour could invade at that moment and of the
@@ -48,8 +53,11 @@ import sim_modules as MS  # noqa: E402
 from analysis import switch_features  # noqa: E402
 
 
-DEFAULT_CAPTURE = Path(
-    r"E:\MasterProject\checkpoints\switches_p0.3_a0.0125_g0.03_20261029_150918_cd0568f6")
+CAPTURE_NAME = "switches_p0.3_a0.0125_g0.03_20261029_150918_cd0568f6"
+# The project's checkpoints folder first, where a gathered copy unpacks, then where it was made.
+CAPTURE_PLACES = (PROJECT_ROOT / "checkpoints" / CAPTURE_NAME,
+                  Path(r"E:\MasterProject\checkpoints") / CAPTURE_NAME)
+DEFAULT_CAPTURE = next((place for place in CAPTURE_PLACES if place.is_dir()), CAPTURE_PLACES[0])
 SIZE = (1600, 900)  # Pixels; even sides, as H.264 with 4:2:0 colour needs.
 SMOOTH = 200  # Samples, as in the notebook: 0.2M steps.
 # The notebook's colours and surfaces, so the video reads like its figures.
@@ -167,7 +175,7 @@ def colour_of(species, palette=None, highlight=None):
 
 
 class Capture:
-    """Series, per-state measures and state files of one capture."""
+    """Series, per-state measures and kept state files of one capture."""
 
     def __init__(self, root):
         self.root = Path(root)
@@ -177,7 +185,11 @@ class Capture:
             self.times = saved["timesteps"]
             self.diversity = saved["living_species"].astype(np.float64)
             self.patches = saved["patches"].astype(np.float64)
+        # Every tracked sample has a state file until the capture is pruned; after that only
+        # some do, and the rest are replayed.
         self.files = switch_features.state_files(self.root)
+        self.kept = np.array([MS._checkpoint_timestep(path) for path in self.files],
+                             dtype=np.int64)
         self.features = switch_features.load_features(self.root)
         if not np.array_equal(self.features["timestep"], self.times):
             raise ValueError("features.npz does not match series.npz; delete it to rebuild")
@@ -186,9 +198,10 @@ class Capture:
         self.smooth_d = MS._gaussian_smooth(self.diversity, SMOOTH)
         self.smooth_p = MS._gaussian_smooth(self.patches, SMOOTH)
         self.first_new = int(self.features["introduced"][0]) + 1
+        self.memo = None  # The first state of the last replay, where the next one may start.
 
     def sample(self, timestep):
-        """Index of the last kept state at or before a timestep."""
+        """Index of the last tracked sample at or before a timestep."""
         return int(np.searchsorted(self.times, timestep, side="right")) - 1
 
     def arrivals(self, species):
@@ -203,43 +216,95 @@ class Capture:
         return ("high regime" if self.points["rise"] <= index < self.points["collapse"]
                 else "low regime")
 
-    def load(self, index):
-        with np.load(self.files[index]) as saved:
+    def is_kept(self, timestep):
+        index = int(np.searchsorted(self.kept, timestep))
+        return index < self.kept.size and self.kept[index] == timestep
+
+    def load(self, timestep):
+        """The state kept at exactly this timestep."""
+        if not self.is_kept(timestep):
+            raise KeyError(f"no state kept at t = {timestep:,}")
+        with np.load(self.files[int(np.searchsorted(self.kept, timestep))]) as saved:
             return {"lattice": saved["lattice"], "Gamma": saved["Gamma"],
                     "current_species": saved["current_species"].astype(np.int64),
                     "newest_species": int(saved["newest_species"]),
                     "timestep": int(saved["timestep"]),
                     "rng_state": json.loads(str(saved["rng_state"].item()))}
 
+    def start_for(self, timestep):
+        """The latest state at or before a timestep without replaying: kept, or remembered."""
+        index = int(np.searchsorted(self.kept, timestep, side="right")) - 1
+        if index < 0:
+            raise ValueError(f"t = {timestep:,} is before the capture's first state")
+        kept = int(self.kept[index])
+        if self.memo is not None and kept < self.memo["timestep"] <= timestep:
+            return self.memo
+        return self.load(kept)
 
-def replay(capture, first, last):
-    """Every state from timestep first to last, replayed from the kept state before first.
+    def next_stop(self, timestep, target):
+        """Where a replay from timestep towards target next stops to check itself."""
+        stops = [target]
+        for times in (self.times, self.kept):
+            index = int(np.searchsorted(times, timestep, side="right"))
+            if index < times.size:
+                stops.append(int(times[index]))
+        return min(stops)
 
-    Each replayed state that lands on a kept state must equal it exactly, including the random
-    number state; the replay then continues to the next kept state after last to check the end.
-    """
-    settings = capture.plan["simulation"]
-    # Start strictly before first, so a window that begins on a kept state still shows it.
-    state = capture.load(capture.sample(first - 1))
-    end_check = capture.times[min(capture.sample(last - 1) + 1, capture.times.size - 1)]
-    while state["timestep"] < max(last, end_check):
-        result = MS.simulation_from_state(
-            state, gamma=settings["gamma"], alpha=settings["alpha"], T=1, track_every=1,
-            max_forbidden_cycle_length=settings["max_forbidden_cycle_length"],
-            max_cycle_rejection_attempts=settings["max_cycle_rejection_attempts"])
-        state = {key: result[key] for key in STATE_KEYS}
-        state["current_species"] = np.asarray(state["current_species"], dtype=np.int64)
-        if (state["timestep"] - capture.times[0]) % capture.track == 0:
-            saved = capture.load(capture.sample(state["timestep"]))
+    def check(self, state):
+        """Stop if a replayed state differs from a kept state or a recorded sample."""
+        timestep = state["timestep"]
+        if self.is_kept(timestep):
+            saved = self.load(timestep)
             if not (np.array_equal(state["lattice"], saved["lattice"])
                     and np.array_equal(state["Gamma"], saved["Gamma"])
                     and np.array_equal(state["current_species"], saved["current_species"])
                     and state["newest_species"] == saved["newest_species"]
                     and state["rng_state"] == saved["rng_state"]):
-                raise RuntimeError(f"replay differs from the kept state at t = "
-                                   f"{state['timestep']:,}; stopping")
-        if first <= state["timestep"] < last:
-            yield state
+                raise RuntimeError(f"replay differs from the kept state at t = {timestep:,}; "
+                                   "stopping")
+        index = int(np.searchsorted(self.times, timestep))
+        if index < self.times.size and self.times[index] == timestep:
+            offsets = self.features["offsets"]
+            recorded = self.features["species_id"][offsets[index]:offsets[index + 1]]
+            if not np.array_equal(np.sort(state["current_species"]), np.sort(recorded)):
+                raise RuntimeError(f"replay's living species differ from features.npz at "
+                                   f"t = {timestep:,}; stopping")
+
+
+def replay(capture, timesteps):
+    """The state at each of the given increasing timesteps.
+
+    A state the capture keeps is loaded when reaching it would otherwise take a whole tracking
+    interval of replay or more; everything else is replayed in memory from the newest kept state
+    before it, or from the first state of the previous replay when that is later. Every kept
+    state and tracked sample the replay passes is checked (Capture.check).
+    """
+    settings = capture.plan["simulation"]
+    state = None
+    for count, target in enumerate(np.asarray(timesteps, dtype=np.int64)):
+        target = int(target)
+        if state is None or target - state["timestep"] >= capture.track:
+            start = capture.start_for(target)
+            if state is None or start["timestep"] > state["timestep"]:
+                state = start
+        if state["timestep"] > target:
+            raise ValueError("replay needs increasing timesteps")
+        if count == 0 and target - state["timestep"] > capture.track:
+            print(f"  replaying {target - state['timestep']:,} steps from the state kept at "
+                  f"t = {state['timestep']:,}", flush=True)
+        while state["timestep"] < target:
+            steps = capture.next_stop(state["timestep"], target) - state["timestep"]
+            result = MS.simulation_from_state(
+                state, gamma=settings["gamma"], alpha=settings["alpha"], T=steps,
+                track_every=steps,
+                max_forbidden_cycle_length=settings["max_forbidden_cycle_length"],
+                max_cycle_rejection_attempts=settings["max_cycle_rejection_attempts"])
+            state = {key: result[key] for key in STATE_KEYS}
+            state["current_species"] = np.asarray(state["current_species"], dtype=np.int64)
+            capture.check(state)
+        if count == 0:
+            capture.memo = state
+        yield state
 
 
 def build_figure(capture, title, subtitle, trace, newcomer_age, palette=None, highlight=None):
@@ -440,8 +505,8 @@ def sampled_video(capture, name, args):
                             subtitle, trace, newcomer_age, palette, args.highlight)
 
     def frames():
-        for frame, index in enumerate(range(lo, hi + 1), 1):
-            state = capture.load(index)
+        states = replay(capture, capture.times[lo:hi + 1])
+        for frame, (index, state) in enumerate(zip(range(lo, hi + 1), states), 1):
             arrived = int(features["introduced"][index] - features["introduced"][max(index - 1, 0)])
             info = (f"t = {t_m[index]:.3f}M    frame {frame:,} of {hi - lo + 1:,}\n"
                     f"{capture.diversity[index]:.0f} living species (smoothed "
@@ -469,7 +534,7 @@ def step_video(capture, centre, args):
     seen = set()  # Every species alive in some frame, for the age palette.
     newest = None
     print(f"  measuring {lead:,} to {last:,}", flush=True)
-    for state in replay(capture, lead, last):
+    for state in replay(capture, np.arange(lead, last)):
         if newest is not None:
             for species in range(newest + 1, state["newest_species"] + 1):
                 exact[species] = state["timestep"]
@@ -500,7 +565,7 @@ def step_video(capture, centre, args):
 
     def frames():
         previous = None
-        for frame, state in enumerate(replay(capture, first, last)):
+        for frame, state in enumerate(replay(capture, np.arange(first, last))):
             new = ([] if previous is None
                    else list(range(previous + 1, state["newest_species"] + 1)))
             previous = state["newest_species"]

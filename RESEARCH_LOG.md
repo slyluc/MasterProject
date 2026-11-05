@@ -107,6 +107,8 @@ do in the paper?
   threshold of about 59%. The habitat therefore breaks into many isolated pockets, and each keeps
   species of its own. The roughly 2,600 species are an artefact of fragmentation, which led to the
   largest-cluster rule (7 Oct). Its Γ matrices also made this one run's snapshots grow to 57 GB.
+  The p = 0.2 count is inflated too: at its last snapshot 15 of its 64 species lived only in the 56
+  cut-off sites. Both runs were removed on 5 Nov; the p = 0 and p = 0.05 runs are one cluster and stay.
 
 #### 2026-09-15 14:18 / 17:25: faster plotting and snapshot retention (`git 3652822`, `git 5bfe5c0`)
 - **Why (recorded in the commit and README):** storage was "bloating". A 100M-step run tracked every
@@ -146,6 +148,10 @@ do in the paper?
   - **Caveat:** these runs predate the largest-cluster rule. At p ≤ 0.2 the cut-off pockets are small
     (97 of about 32,000 sites in the later p = 0.2 lattice), so a pocket artefact is unlikely. Still,
     γ ≥ 0.1 with blocking has not been repeated under the rule.
+- **Later understanding (5 Nov):** the caveat was wrong. Each pocket, even a single site, keeps a
+  species of its own, so the γ = 0.15 ladder counted mostly pocket species. At the last snapshots the
+  largest cluster held 3–5 species for p = 0.075–0.15 and 17 at p = 0.2, against 6–62 counted. The
+  p ladder and the p = 0.15 branches were removed (see 5 Nov, 14:19).
 
 #### 2026-10-01 12:46 – 2026-10-02 14:30: counting cycles around switches (`git 56c55db`, `git ed9de9e`, `git 1297b35`)
 - **Done:** `show_gamma_cycle_histogram` counts directed simple cycles in the Γ snapshots kept near
@@ -425,6 +431,84 @@ do in the paper?
   - **What it shows:** the magenta band moves through the cyan with red close behind. It is visible
     from 0:24 to 0:35.
 
+#### 2026-11-05 11:29–12:40: one snapshot per million, gathered for the move to another machine (`session 2026-11-05`, `tools/prune_checkpoints.py`, `MS.recreate_checkpoint`)
+- **Why (recorded):** the work moves to another environment. The request was to collect every
+  checkpoint on this PC into one folder and one zip for Google Drive. Only one snapshot per million
+  steps is kept, and the others are rebuilt from the saved random state when needed.
+- **Done:**
+  - All checkpoints on this PC are in two places: the project's `checkpoints/` (29 folders, 67 GB)
+    and the switch capture on `E:` (7.4 GB). The only other copies are old runs in the Recycle Bin
+    and a scratch run, which were left out.
+  - `tools/prune_checkpoints.py` was rewritten. It used to keep snapshots around swaps; it now
+    works per folder (run, batch job or capture segment) and keeps the first snapshot of each whole
+    million plus the newest. Missing patch counts are recorded before a snapshot goes. It can thin
+    in place (`--apply`), or copy the thinned folders into one folder and zip them
+    (`--into … --zip`).
+  - `MS.recreate_checkpoint` rebuilds a removed snapshot by replaying from the newest earlier one in
+    its folder.
+  - The video tool and `switch_analysis.ipynb` now replay states the capture no longer keeps.
+    `features.npz` is protected from being rebuilt out of a thinned capture.
+- **Result:**
+  - **Replay is exact for every run family.** One check per folder, 155 in all, replayed from a kept
+    snapshot to the next removed one. Lattice, Γ, species, histories and random state matched every
+    time. This covered the early single runs, percolation, largest cluster, the no-short-cycle
+    grids, the α and γ branches and the capture segments.
+  - **Cost:** replay runs at 1,300–1,800 time units per second, so any snapshot is at most about
+    13 minutes from its million.
+  - **Size:** 875 MB of the 68.9 GB of snapshots are kept. With the analysis records, plans, capture
+    series, features and videos, the copy holds 2,434 files (1.8 GB). `checkpoints.zip` is
+    936 MB, and every entry's checksum was tested. The originals were left in place.
+- **What it changes:**
+  - Analyses that read many snapshots (lattice animations, Γ cycle counts summed over snapshots, the
+    zoom on a swap in `sim_analysis`) see one snapshot per million unless states are rebuilt.
+  - The capture's 1,000-step series and per-state features are kept whole, so its curves and
+    statistics do not change.
+
+#### 2026-11-05 14:19: September runs with cut-off pockets removed (`session 2026-11-05`)
+- **Why (recorded):** runs from before the largest-cluster rule are "de facto wrong" and are to be
+  redone. The alternative considered was to cut each run down to its largest cluster after the fact.
+- **Checked:**
+  - 21 run folders predate the rule; their snapshots carry no `largest_cluster_only` field. Blocked
+    sites never change, so one snapshot gives each run's habitat.
+  - **12 already form one cluster**, so the rule would have produced exactly the same run: every
+    p = 0 run (`base_run`, `gamma_02_branch`, γ = 0.07–0.09) and every p = 0.05 run (γ = 0.07–0.10).
+    They were kept.
+  - **9 have usable sites outside the largest cluster.** At their last snapshots:
+
+    | Run | Cut-off sites | Species in the largest cluster | Species only in pockets |
+    |---|---|---|---|
+    | γ = 0.07, p = 0.2 | 56 | 49 | 15 |
+    | γ = 0.07, p = 0.5 | 19,556 | 1 | 2,603 |
+    | γ = 0.15, p = 0.075 | 3 | 3 | 3 |
+    | γ = 0.15, p = 0.10 | 4 | 3 | 4 |
+    | γ = 0.15, p = 0.125 | 17 | 3 | 16 |
+    | γ = 0.15, p = 0.15 | 24 | 5 | 21 |
+    | γ = 0.15, p = 0.2 | 56 | 17 | 45 |
+    | γ = 0.10, p = 0.15 (branch) | 24 | 25 | 24 |
+    | γ = 0.30, p = 0.15 (branch) | 24 | 3 | 24 |
+
+- **Why they were not repaired:**
+  - The species and patch series were counted over the whole lattice every 10,000 steps, while
+    snapshots exist only at some times. Cutting the snapshots down cannot correct the series.
+  - A recount would mean replaying each run from its start and counting only the largest cluster:
+    470M time units, roughly 70–100 CPU hours. Two runs no longer have their start state (γ = 0.07,
+    p = 0.5 and γ = 0.15, p = 0.10; first snapshots at 8.65M and 29M).
+  - Even that would not be the rule's model. The old runs spread introductions over every usable
+    site, pockets included, so the largest cluster received 99.8% of them at p = 0.2 but only 2% at
+    p = 0.5.
+  - They are single runs that are to be redone anyway.
+- **Done:**
+  - The 9 runs (1.8 GB) were moved out of `checkpoints/`, and their thinned copies out of
+    `E:\MasterProject\export`, into folders named `delete_me_pre_largest_cluster_runs` on D: (beside
+    the project) and on E:, to be deleted.
+  - The export and `checkpoints.zip` were rebuilt without them: 843 MB of 67.1 GB of snapshots kept,
+    146 replay checks all exact, 2,370 files (1.8 GB), and a 933 MB zip with every checksum tested.
+  - `nb sim_notebook` no longer loads or plots them.
+- **What it changes:**
+  - D3 is withdrawn. Whether blocking raises diversity when all cycles are allowed is open again.
+  - The 28 Sep caveat that a pocket artefact was unlikely was wrong. Every pocket keeps a species of
+    its own, however small it is.
+
 ---
 
 ## 2. Register of discoveries
@@ -433,8 +517,8 @@ do in the paper?
 |---|---|---|---|---|
 | D1 | At the paper's Fig. 3 parameters the model switches repeatedly between high and low diversity | Observed (1 run) | 30 Aug | `run gamma_07_alpha_0125` |
 | D2 | With all cycles allowed, p = 0.05 and α = 0.0125, the high state is lost between γ = 0.073 and 0.09 | Established (24 runs) | 6 Oct | `run gamma_sweep_perc05_largest_…` |
-| D3 | Blocked sites raise diversity when all cycles are allowed (γ = 0.15: 7 → 52 species as p goes 0.075 → 0.2) | Observed (single runs, before the largest-cluster rule) | 28 Sep | `run gamma_15_alpha_0125_perc_*` |
-| D4 | A habitat broken into pockets (p = 0.5) creates spurious diversity; hence the largest-cluster rule | Established (methodological) | 30 Aug / 7 Oct | `run gamma_07_alpha_0125_perc_50`, `git 9798582` |
+| D3 | ~~Blocked sites raise diversity when all cycles are allowed (γ = 0.15: 7 → 52 species as p goes 0.075 → 0.2)~~ | Withdrawn 5 Nov: mostly species in cut-off pockets; the largest cluster held 3–5 species for p ≤ 0.15 and 17 at p = 0.2 | 28 Sep | `run gamma_15_alpha_0125_perc_*` (removed 5 Nov) |
+| D4 | A habitat broken into pockets creates spurious diversity, even when the pockets are single sites; hence the largest-cluster rule | Established (methodological) | 30 Aug / 7 Oct; 5 Nov | `run gamma_07_alpha_0125_perc_50` (removed 5 Nov; 2,603 of 2,604 species outside the largest cluster), `git 9798582` |
 | D5 | With cycles of length 2–6 rejected and p ≤ 0.1, diversity is lost at every γ from 0.02 to 0.12 | Established (44 runs) | 8 Oct | three sweeps, Phase III |
 | D6 | With 20–30% of sites blocked, high diversity returns at γ = 0.03 without short cycles (90–95 species), but not at γ ≥ 0.05, nor at p = 0.1 or 0.5 | Observed (1 run per cell; p = 0.2 and 0.3 agree) | 9 Oct | `run no_short_cycles_p_gamma_…` |
 | D7 | Hysteresis in α: at α ≤ 0.002 an established community persists, but fresh runs need α ≳ 0.008–0.012 to become diverse | Observed (2 siblings + 3 fresh runs per α) | 23 Oct | `nb sim_analysis §2–7` |
@@ -494,6 +578,9 @@ on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their
 - **Changing γ** also changes the introduction rate α·γ.
 - **Effective p** exceeds nominal p once the cut-off pockets are blocked: 20.4% for p = 0.2 and 31.3%
   for p = 0.3.
+- **No pocket is too small to matter:** a cut-off pocket, even a single site, keeps a species of its own
+  until a newcomer lands on it. A few dozen cut-off sites therefore add a few dozen species to the
+  count. Only runs whose usable sites form one cluster are kept.
 - **Two switch detectors:**
   - The simulator keeps snapshots around swaps found with thresholds relative to each run's own level.
   - The notebooks count regimes with fixed thresholds of 10 and 50 species.
@@ -501,6 +588,9 @@ on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their
 - **Cycle counts above length 4** are sampled estimates, and counts sum over snapshots.
 - **Speed changes are verified bit-exact:** every kernel change is checked against full trajectories,
   including the random-number state.
+- **Any snapshot can be rebuilt:** the random draws do not depend on how the steps are split between
+  calls, so replaying from a saved snapshot reproduces the run exactly. Since 5 Nov only one snapshot
+  per million is kept, and a rebuild costs up to about 13 minutes.
 - **Plotting:** one colour and marker per run, kept fixed, and no means over n ≤ 3 sibling runs.
 
 ---
@@ -509,10 +599,11 @@ on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their
 
 | Data | Location |
 |---|---|
-| Early single runs (Aug–Oct) | `checkpoints/gamma_*`, `checkpoints/base_run`, `checkpoints/gamma_02_branch` |
+| Early single runs (Aug–Sep), p = 0 and 0.05 only | `checkpoints/gamma_*`, `checkpoints/base_run`, `checkpoints/gamma_02_branch` |
 | Sweeps and grids (Oct) | `checkpoints/gamma_sweep_perc05_largest_…`, `checkpoints/no_short_cycles_*` |
 | Fresh α runs r3–r5 (analysis records only) | `checkpoints/alpha_p20_g003_fresh_rep3-5_analysis` |
 | Switch capture, features and videos | `E:\MasterProject\checkpoints\switches_p0.3_a0.0125_g0.03_20261029_150918_cd0568f6` |
+| All of the above, one snapshot per million (5 Nov) | `E:\MasterProject\export\checkpoints` and `checkpoints.zip` beside it; unzip at the project root elsewhere |
 | Analyses | [analysis/sim_notebook.ipynb](analysis/sim_notebook.ipynb), [analysis/sim_analysis.ipynb](analysis/sim_analysis.ipynb), [analysis/switch_analysis.ipynb](analysis/switch_analysis.ipynb) |
 
 ---

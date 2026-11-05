@@ -15,6 +15,7 @@ import tempfile
 from numba import njit
 import numpy as np
 
+import sim_modules as MS
 from sim_modules import _gaussian_smooth, _merge_patch_sites, _patch_root
 from tools.run_switch_capture import regime_switches
 
@@ -29,12 +30,51 @@ PER_SPECIES = ("species_id", "abundance", "front", "in_degree", "out_degree", "i
 
 
 def state_files(root):
-    """The capture's starting state, then every segment's states, in time order."""
+    """The capture's starting state, then every segment's kept states, in time order.
+
+    A capture thinned by tools/prune_checkpoints.py keeps only some states; the rest are
+    replayed from them (tools/render_switch_videos.py, sim_modules.recreate_checkpoint).
+    """
     root = Path(root)
     plan = json.loads((root / "capture_plan.json").read_text(encoding="utf-8"))
     files = [root / plan["initial_state"]]
     files += sorted(root.glob("segments/*/checkpoint_*.npz"))
     return files
+
+
+def states_at(root, timesteps):
+    """The capture's state at each of the given non-decreasing timesteps.
+
+    A kept state is loaded. Any other is replayed in memory from the newest kept state before
+    it, or onwards from the previous state yielded when that is later; the saved random state
+    makes the replay exact. In a capture thinned to one state per million steps, a replay can
+    cover up to a million steps, about ten minutes.
+    """
+    root = Path(root)
+    settings = json.loads((root / "capture_plan.json").read_text(encoding="utf-8"))["simulation"]
+    files = state_files(root)
+    kept = np.array([MS._checkpoint_timestep(path) for path in files], dtype=np.int64)
+    state = None
+    for target in np.asarray(timesteps, dtype=np.int64).tolist():
+        if state is not None and target < state["timestep"]:
+            raise ValueError("states_at needs non-decreasing timesteps")
+        index = int(np.searchsorted(kept, target, side="right")) - 1
+        if index < 0:
+            raise ValueError(f"t = {target:,} is before the capture's first state")
+        if state is None or state["timestep"] < kept[index]:
+            state = MS.load_checkpoint(files[index])
+        if state["timestep"] < target:
+            steps = target - state["timestep"]
+            result = MS.simulation_from_state(
+                state, gamma=settings["gamma"], alpha=settings["alpha"], T=steps,
+                track_every=steps,
+                max_forbidden_cycle_length=settings["max_forbidden_cycle_length"],
+                max_cycle_rejection_attempts=settings["max_cycle_rejection_attempts"])
+            state = {key: result[key] for key in ("lattice", "Gamma", "newest_species",
+                                                  "timestep", "rng_state")}
+            state["current_species"] = [int(species) for species in result["current_species"]]
+            state["diversity"] = len(state["current_species"])
+        yield state
 
 
 def switch_points(timesteps, diversity, rule, smooth=200):
@@ -205,14 +245,26 @@ def _write_npz(path, arrays):
 
 
 def load_features(root, workers=None, refresh=False):
-    """Features of every state of a capture, from its cache when that is still current."""
+    """Features of every state of a capture, from its cache when that is still current.
+
+    The cache is current when it covers every tracked sample in series.npz. Building it needs
+    every state, so a thinned capture keeps its cache and refuses to rebuild it.
+    """
     root = Path(root)
     files = state_files(root)
     cache = root / CACHE
+    samples = len(files)
+    if (root / "series.npz").exists():
+        with np.load(root / "series.npz") as series:
+            samples = series["timesteps"].size
     if cache.exists() and not refresh:
         with np.load(cache) as saved:
-            if int(saved["version"]) == CACHE_VERSION and saved["timestep"].size == len(files):
+            if int(saved["version"]) == CACHE_VERSION and saved["timestep"].size == samples:
                 return {key: saved[key] for key in saved.files}
+    if len(files) < samples:
+        raise FileNotFoundError(
+            f"{cache} is missing or stale, and rebuilding it needs all {samples:,} states; "
+            f"the capture keeps {len(files):,} (thinned by tools/prune_checkpoints.py)")
     workers = workers or max(1, min(8, (os.cpu_count() or 2) - 2))
     with ProcessPoolExecutor(max_workers=workers) as pool:
         states = list(pool.map(state_features, files, chunksize=64))

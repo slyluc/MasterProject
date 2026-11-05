@@ -1024,6 +1024,93 @@ def load_checkpoint(path):
     return state
 
 
+def recreate_checkpoint(path, timestep=None, *, start=None):
+    """Load a snapshot, or rebuild one that pruning removed by replaying to it.
+
+    ``path`` is the snapshot file, which may no longer exist, or its folder
+    together with ``timestep``. A snapshot still on disk is simply loaded.
+    A missing one is replayed from the newest snapshot saved before it in the
+    same folder, or from ``start`` when given; ``start`` also forces a replay
+    of a snapshot that exists, to check the replay against the file.
+
+    Each snapshot stores the random state that continued the run, so the
+    replay is exact: the lattice, Gamma, species, histories and random state
+    equal what the run wrote. It costs about one second per 1,500 time units
+    on a 200x200 lattice, so at most a quarter of an hour in a folder pruned
+    to one snapshot per million. Returns the same dictionary as
+    ``load_checkpoint``, plus ``replayed_from`` after a replay.
+    """
+    path = Path(path).expanduser()
+    if timestep is None:
+        directory, timestep = path.parent, _checkpoint_timestep(path)
+        if timestep < 0:
+            raise ValueError(f"not a checkpoint file name: {path.name}")
+    else:
+        directory, timestep = path, int(timestep)
+    target = directory / f"checkpoint_{timestep:012d}.npz"
+    if start is None:
+        if target.is_file():
+            return load_checkpoint(target)
+        earlier = [
+            candidate for candidate in directory.glob("checkpoint_*.npz")
+            if 0 <= _checkpoint_timestep(candidate) < timestep
+        ]
+        if not earlier:
+            raise FileNotFoundError(
+                f"no snapshot before timestep {timestep:,} in {directory}"
+            )
+        start = max(earlier, key=_checkpoint_timestep)
+    start = Path(start).expanduser()
+    state = load_checkpoint(start)
+    if state["timestep"] >= timestep:
+        raise ValueError(
+            f"{start.name} is not before timestep {timestep:,}"
+        )
+    # The original run tracked every track_every steps, so replaying with the
+    # same interval rebuilds the same history; the random draws do not
+    # depend on how the steps are chunked.
+    result = simulation_from_state(
+        state,
+        gamma=state["gamma"],
+        alpha=state["alpha"],
+        T=timestep - state["timestep"],
+        track_every=state["track_every"],
+        continue_history=True,
+    )
+    # target_timestep, the end the run was heading for, stays the start's.
+    recreated = dict(state)
+    for key in ("lattice", "Gamma", "newest_species", "timestep",
+                "tracked_timesteps", "diversity_history", "patch_history",
+                "rng_state"):
+        recreated[key] = result[key]
+    recreated["current_species"] = [
+        int(species) for species in result["current_species"]
+    ]
+    recreated["diversity"] = len(recreated["current_species"])
+    recreated["checkpoint_path"] = str(target.resolve())
+    recreated["replayed_from"] = str(start.resolve())
+    # A replay without a checkpoint folder counts no patches; take the counts
+    # the run recorded, and count the final lattice, which is at hand.
+    times = np.asarray(recreated["tracked_timesteps"], dtype=np.int64)
+    patches = np.asarray(recreated["patch_history"], dtype=np.int64).copy()
+    analysis = load_analysis(directory)
+    if analysis is not None and np.size(analysis["tracked_timesteps"]):
+        recorded_times = np.asarray(analysis["tracked_timesteps"], dtype=np.int64)
+        recorded = np.asarray(analysis["patch_history"], dtype=np.int64)
+        position = np.minimum(np.searchsorted(recorded_times, times),
+                              recorded_times.size - 1)
+        found = (patches < 0) & (recorded_times[position] == times)
+        patches[found] = recorded[position[found]]
+    if patches.size and patches[-1] < 0:
+        patches[-1] = count_patches(recreated["lattice"])
+    recreated["patch_history"] = patches
+    if "event_timesteps" in state:
+        events = (np.asarray(analysis["event_timesteps"]) if analysis is not None
+                  else np.asarray(state["event_timesteps"]))
+        recreated["event_timesteps"] = events[events <= timestep].copy()
+    return recreated
+
+
 def _normalize_initial_state(initial_state):
     """Validate and copy public/checkpoint state for a new simulation leg."""
     if isinstance(initial_state, (str, os.PathLike)):
