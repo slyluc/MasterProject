@@ -3,7 +3,7 @@
 This log records the project's reasoning, not its code. For each step it gives the question asked,
 why it was asked, what was done, what came out, and what that changed in the understanding. The
 engineering detail lives in [README.md](README.md), the analyses in [analysis/](analysis/), and the
-model's source paper in [emergence_of_diversity_in_a_model_ecosystem.md](emergence_of_diversity_in_a_model_ecosystem.md).
+model's source paper in [articles/emergence_of_diversity_in_a_model_ecosystem.md](articles/emergence_of_diversity_in_a_model_ecosystem.md).
 
 ## Conventions
 
@@ -28,7 +28,8 @@ model's source paper in [emergence_of_diversity_in_a_model_ecosystem.md](emergen
   - **Hypothesis:** proposed but not yet tested.
 - **Mean species** is the time-mean of living species over the second half of a run's own span, unless
   stated otherwise. **Regimes** follow `sim_analysis.ipynb`: the series is Gaussian-smoothed over 0.2M,
-  "high" holds from reaching 50 species until falling to 10, and "low" otherwise.
+  "high" holds from reaching 50 species until falling to 10, and "low" otherwise. Since 11 Nov, entries
+  on the 9 Nov campaign use the mode-based lines of `campaign_analysis.ipynb` instead (D19).
 
 ---
 
@@ -509,6 +510,238 @@ do in the paper?
   - The 28 Sep caveat that a pocket artefact was unlikely was wrong. Every pocket keeps a species of
     its own, however small it is.
 
+### Phase VI: a queued campaign for the open questions (9 Nov –)
+
+#### 2026-11-09 16:14: 45 runs aimed at Q3, Q4, Q5, Q7 and D3 (`session 2026-11-09`, `tools/run_campaign.py`, `run E:\MasterProject\checkpoints\campaign_20261109_161426_f78322dc`)
+- **Why (recorded):** "what is low hanging fruit for simulations we can start now, for inspection
+  later to get information on some of our questions?", then "Write a launcher / tool and just start it."
+- **Machine budget:** this PC has 16 physical cores (32 logical).
+  - Batch file times on it show that 16 workers ran about 5M steps per hour per run, about 80M/h in
+    all.
+  - 24 workers ran 2.7–3.4M/h per run, with no more steps in total.
+  - The campaign therefore uses 16 slots.
+- **Tool:** `tools/run_campaign.py` queues every run as its own child process: a one-job batch, or an
+  exact continuation. A freed slot goes to the next run in the plan. A run that stops with an error
+  restarts from its newest checkpoint.
+- **Design,** in launch order. All runs use short-cycle rejection (2–6) unless stated, and the
+  largest cluster only.
+
+  | Group | Question | Runs | Settings | Compare with |
+  |---|---|---|---|---|
+  | `q4_extend_low_alpha` | Q4 | 4 | α sweep r1/r2 at α = 0.001 and 0.002, continued exactly from 150M to 350M | the same runs to 150M |
+  | `q5_fixed_rate_from_B` | Q5 | 4 | parent B, γ = 0.04, 0.05, 0.07, 0.09, with α·γ held at 3.75×10⁻⁴; 100M | γ swap |
+  | `q5_raised_alpha_from_B` | Q5 | 4 | parent B, γ = 0.03, α = 0.0167, 0.0208, 0.0292, 0.0375 (the γ swap's arrival rates at those γ); 100M | γ swap control |
+  | `q7_threshold_p0` | Q7 | 6 | fresh, p = 0, γ = 0.025 and 0.05 × rejecting none, 2–4 or 2–5; 50M | paper Fig. 6 |
+  | `d3_all_cycles_redo` | D3 | 7 | fresh, all cycles allowed: γ = 0.15 at p = 0; γ = 0.07 and 0.15 at p = 0.1, 0.2, 0.3; 50M | `gamma_07_alpha_0125` (p = 0) |
+  | `q4_alpha_control_from_A` | Q4, D7 | 2 | parent A, α = 0.0125 (the missing control), siblings; 100M | α sweep |
+  | `q4_low_alpha_from_B` | Q4 | 2 | parent B, α = 0.001 and 0.002; 100M | α sweep (parent A) |
+  | `q3_p_ladder_g003` | Q3, Q2, D6 | 16 | fresh, γ = 0.03, p = 0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4 × 2 independent seeds; 100M | grid (one run per cell) |
+
+- **Seeds:** root 6772. Run k of the plan uses base seed 6,772,000 + k. Continuations keep their own
+  saved random state.
+- **Checked before launch:**
+  - Parents A and B match the fingerprints recorded in the α-sweep and γ-swap plans.
+  - On a 20 × 20 test campaign, a continuation equalled the uninterrupted run in lattice, Γ, random
+    state and history.
+- **Expected cost:** 4,250M steps, about 53 h at 16 slots if every run made 5M/h.
+  - The first 5 minutes ran slower: 3.6–3.8M steps per hour for the diverse branches and
+    continuations, and 5.5–6.4M/h for the fresh runs. That is about 67M/h in all.
+  - At that pace the campaign takes about 63 h, and the 200M continuations alone take about 52 h.
+- **Caveats:**
+  - Arm A of Q5 lowers α, and α = 0.003–0.008 collapsed on its own on parent A (D7). Arm B, which
+    raises α at fixed γ, is therefore the cleaner test.
+  - Fresh p = 0.2 runs took 28–93M to first rise, so a fresh run that never rises within 100M is not
+    proof that its p cannot hold diversity. The time to first rise should be recorded.
+- **Not in the campaign:**
+  - Q1 and Q6 need the relay classifier, not more CPU. The unthinned γ-swap originals on D: still
+    keep states every 10,000 steps within ±1M of about 40 switches, and the new runs keep the same
+    windows around their own switches.
+  - The quasistatic half of Q7 needs new code.
+
+#### 2026-11-11 10:42: first analysis of the finished campaign runs (`session 2026-11-11`, `nb campaign_analysis`)
+- **Why (recorded):** "I would like you to create a notebook with a lean analysis of the runs that have
+  already finished, with space for more analysis when the other runs finish."
+- **What was done:**
+  - 27 of 45 runs were done at 10:31. Q5, Q7 and D3 are complete, Q4 has 4 of 8 runs and Q3 has 2
+    of 16.
+  - `analysis/campaign_analysis.ipynb` has one part per question: the question, how it was tested,
+    figures, and a short conclusion.
+  - `analysis/campaign_runs.py` opens only runs that the campaign status marks done.
+  - Regimes and windows follow `sim_analysis.ipynb`: high from 50 until 10 species (smoothed), with
+    means over the second half of each run.
+- **Q5 (complete):** the branches from parent B separate link density from arrival rate.
+  - **Raising only the rate** (γ = 0.03, α raised to the γ swap's rates) kept all 4 runs high for the
+    whole of 50–100M, at a mean of 68–87 species. The unchanged control had 38 species and was high
+    51% of the time.
+  - **Raising only γ** (α·γ held at 3.75×10⁻⁴) lost diversity as the γ swap did.
+    - At γ = 0.07 and 0.09 the collapse came within 1.1M and 0.6M (γ swap: 0.6–0.8M).
+    - At γ = 0.04 and 0.05 the means were 13 species, against 49 and 30 in the swap.
+- **Q7, threshold half (complete):** fresh runs at p = 0 over 50M.
+  - Only γ = 0.05 with all cycles allowed became diverse. It rose at 31.6M and was high for 74% of
+    25–50M, at a mean of 67 species.
+  - Rejecting 2–4 or 2–5 at γ = 0.05 kept the runs at a mean of about 3 species. So did every rule at
+    γ = 0.025, and 2–6 at γ = 0.03 (the p-ladder runs at p = 0).
+  - In the paper's quasistatic runs, rejecting 2–4 raised diversity.
+- **D3 redo (complete):** all cycles allowed, largest cluster only.
+  - At γ = 0.15 the mean was 3.5, 5.4, 11.2 and 17.5 species at p = 0, 0.1, 0.2 and 0.3, all in the
+    low regime.
+  - At γ = 0.07, the runs at p = 0.1–0.3 never fell below 34 species after their first rise. Their
+    means were 45, 52 and 53.
+  - The p = 0 run (D1) dropped to about 3 species three times in 50M.
+- **Q4 (preliminary):**
+  - The extensions of r2 at α = 0.001, r1 at 0.002 and r2 at 0.002 collapsed to a single species, at
+    185M, 233M and 264M.
+  - Parent B's branch at α = 0.002 collapsed within 6M.
+- **Q3 (preliminary):** at p = 0 both seeds stayed at a mean of 3 species for 100M.
+- **Interpretation:**
+  - γ hurts through link density; more arrivals at the same γ help (D17).
+  - At p = 0 in the full dynamics, even cycles of length 2–4 seem needed for diversity to emerge
+    (D18). The rejection threshold alone does not explain the gap to the paper.
+  - D3 survives in a weak form (D16).
+  - The low-α persistence of D7 looks like slow decay rather than bistability, pending the α = 0.0125
+    controls.
+- **Caveats:**
+  - Mostly one run per cell.
+  - The fixed-rate arm of Q5 also lowers α, to 0.004–0.009.
+  - Q7 starts from one species, whereas the paper started from a diverse state with Γ cleared.
+  - 50M is short for a fresh rise at γ = 0.025.
+
+#### 2026-11-11 11:30: high and low states from the modes of alike runs (`session 2026-11-11`, `nb campaign_analysis §1`)
+- **Why (recorded):**
+  - "the classification of high and low state is a bit outdated. I think we should redefine it
+    better."
+  - "maybe we can over all the alike runs, identify modes, and then take 0.5*M1 where M1 is the highest
+    mode as the crossing line into high state, and the same for low state as defined in the paper."
+  - "high and low state is not correctly identifies from me just looking at the plots" (part 3, the
+    D3 redo).
+  - The user added three papers in `articles/` and pointed to Hofer & Sneppen (2024). The mode rule
+    itself is in Uekermann, Mathiesen & Mitarai, Phys. Rev. E 95, 032409 (2017), §III B. They enter
+    the high state above 0.5·m and leave it below 0.1·m, where m is the high mode of the frozen
+    boundary length.
+- **What was done:** the same rule, applied to living species, since our runs do not record the
+  frozen boundary length (`analysis/campaign_runs.py`).
+  - **Pools:** all 183 finished runs (the campaign and the earlier batches) are pooled by γ, p and
+    cycle rule, over α, seed and parent. That gives 70 pools.
+  - **Modes:** peaks of each pool's smoothed distribution holding at least 5% of the samples, with a
+    dip of at least 10% between them.
+  - **Own lines:** a pool whose low mode lies below 0.1·M1 uses in > 0.5·M1 and out < 0.1·M1.
+  - **Borrowed lines:** other pools take the lines of the nearest such pool with the same cycle rule
+    (same p, else same γ). With no such pool, they are "low only" or "unresolved".
+- **Result:**
+  - Low modes sit at 1.5–3 species everywhere.
+  - High modes: 108 for parent A's setting, 83 for parent B's, 84 with all cycles at γ = 0.05 (p = 0),
+    and 36–40 with all cycles at γ = 0.07–0.09.
+  - The new lines are close to the old ones for parents A and B (in 54 and 41, out 11 and 8). With all
+    cycles at γ ≥ 0.07 they are much lower (in 18–20, out 3.6–4).
+- **Changes to the 10:42 entry:**
+  - The D1 run is high for 86% of 25–50M (old lines: 16%).
+  - The Q5 control is high 64% of its second half (old: 51%).
+  - At γ′ = 0.04–0.05 the γ swap is high 65–84% and the fixed-rate arm 9–15%. So the arrival rate
+    sets the time spent high, as Uekermann et al. found for α.
+  - At γ = 0.15 with all cycles, p = 0.2 and 0.3 are unresolved. Each is a single run at 11–17
+    species, and no alike run shows both states.
+  - The other conclusions stand.
+- **Caveat:** the paper found the frozen boundary length a steadier measure than the species count.
+  Recording it would need a change to the simulator.
+
+#### 2026-11-12 10:47: a mathematical frame for the switches (`session 2026-11-12`)
+- **Why (recorded):** "how I can model this lichen model mathematically, I am mostly concerned about
+  these dynamics of switches between high and low diversity states." `RESEARCH_QUESTIONS.md` also asks
+  why switches are sharp rather than a random drift of diversity.
+- **Done:** no new runs. The findings above and the papers in `articles/` were read for a reduced
+  model. Two checks reuse numbers already in this log.
+- **Proposed frame (hypothesis):**
+  - Count time in arrivals, n = α·γ·t (375 per 1M at α = 0.0125, γ = 0.03). About 80% of states are
+    frozen (D14), so each arrival is close to one self-contained event.
+  - Describe the state by the species count S and a fragmentation coordinate F: the largest patch's
+    share, the patch count, or the frozen boundary length. One variable cannot give different rise and
+    collapse paths (D11, paper Fig. 3B).
+  - Each arrival is one of a few events: an addition on a small patch, a clean sweep of the dominant
+    patch, a relay that leaves islands, a relay that erases them, or a second arrival during a sweep.
+    Their probabilities give a drift and a noise in (S, F).
+  - The fragmentation loop of 31 Oct (fragmentation → additions → species → followers → islands) can
+    give the drift two stable zeros with an unstable one between them. A switch is then a noise-driven
+    escape: dwell times are long and memoryless, transits short, and the paths up and down differ.
+  - Dimensionless groups: γ, γ·S, the overlap ε = α·γ·τ_sweep (Uekermann's α·L scaling, since
+    τ_sweep grows with L), the blocked fraction against the percolation limit of about 0.41, and the
+    system size.
+- **Check 1, the arrival clock.** High-state lifetimes counted in arrivals:
+  - α = 0.001: 4,050 (collapse 135M after the branch). α = 0.002: 10,980 and 12,840.
+  - α = 0.0125, the γ-swap control from parent B: first collapse after 7,275. Parent B at α = 0.002:
+    under 360.
+  - Counted in arrivals, the low-α communities did not outlast the control. D7's persistence may be
+    mostly the slower clock (hypothesis: few runs, two parents).
+- **Check 2, the level of the high state.** γ·S_high = 2.5–4.2 for every high mode in D19, while
+  S_high itself spans 36–108 species (D20).
+- **What it changes:** the relay classifier of Q1 and Q6 would also measure the per-arrival event
+  probabilities that the frame needs. See Q8.
+
+#### 2026-11-12 10:56: campaign finished; Q3 and Q4 answered (`session 2026-11-12`, `nb campaign_analysis §5–6`)
+- **Why (recorded):** "All runs have finished now, so finish the analysis in the notebook, and
+  furthermore reduce the amount of text and prints in that notebook."
+- **What was done:**
+  - All 45 runs were done by 10:01, and the scheduler closed at 10:39 with none failed.
+  - `campaign_analysis.ipynb` was re-run on all 201 finished runs (74 pools). Its printed tables were
+    removed and its text shortened; part 1 now gives each pool's lines beside its distribution.
+  - Q4 gained a panel of the time high before the first collapse, counted in arrivals (α·γ·t, as
+    proposed at 10:47). Q3 gained the time spent high, the level while high (as counted and scaled by
+    √area) and the time to the first rise.
+  - The ladder runs joined parent B's pool (γ = 0.03, p = 0.3, now 10 runs). Its high mode moved from 83
+    to 85 species and its lines to in 42, out 8.5. The γ swap at γ′ = 0.05 is now high 64% of its second
+    half (was 65%); the other numbers of 11 Nov stand.
+- **Q4 (complete):** all branches were made at 50M; a collapse is the first fall below the exit line.
+  - At α ≤ 0.002, 4 of 6 communities collapsed to 1–2 species, 6–213M after the branch: parent A r2 at
+    α = 0.001 (at 185M), r1 and r2 at 0.002 (233M, 263M), and parent B at 0.002 (56M). Parent A r1 at
+    α = 0.001 was still high at 350M, and parent B at α = 0.001 at 150M.
+  - None of the four came back in the 87–165M that followed.
+  - The α = 0.0125 controls: parent A s1 collapsed at 127M (7 species at 150M), and s2 stayed high to
+    150M. Parent B's control collapsed at 70M and rose again four times, each within 1–14M.
+  - In arrivals, the low-α collapses came after 370–12,800 arrivals (still high: 3,000 and 9,000). The
+    controls collapsed after 7,400 (parent B) and 28,700 (parent A s1); s2 was still high at 37,500.
+    This settles the open item of 10:47: parent A's low-α branches collapsed after 4,000–12,800
+    arrivals, its controls after 28,700 or more.
+- **Q3 (complete):** fresh runs at γ = 0.03 with lengths 2–6 rejected, 100M, two seeds per p.
+  - p = 0 and 0.1: neither seed rose; means of 3–5 species.
+  - p = 0.15–0.35: every seed rose. Share of 50–100M high, seeds 1 and 2: 0% and 90% at p = 0.15 (seed 1
+    was high from 11M to 44M), 87% and 29% at 0.2, 41% and 100% at 0.25, 51% and 60% at 0.3, 40% and
+    76% at 0.35.
+  - p = 0.4: neither seed rose. The largest cluster had 12,816 and 19,991 sites (about 27,500 at
+    p = 0.3), with means of 11 and 16 species. The blocked-site percolation threshold is about 0.41.
+  - Median species while high: 104–119 at p = 0.15–0.2, 91–106 at 0.25, 66–71 at 0.3 and 29–31 at 0.35.
+    Scaled by √(40,000 / sites): 113–133, 105–123, 80–85 and 37–39.
+  - First rise: after 11–42M at p = 0.15–0.2, and 1.3–12M at 0.25–0.35.
+  - New pools: p = 0.15 (high mode 113; in 56, out 11.3) and p = 0.25 (92; in 46, out 9.2). p = 0, 0.1,
+    0.35 and 0.4 borrow the lines of p = 0.15 or 0.3.
+- **Interpretation:**
+  - Q4: the high state is metastable at every α. Low α does not stabilise it; it slows the clock and
+    removes the way back (D22). The hysteresis of D7 lies in the way up, not in a second stable state.
+  - Q3: a window of p = 0.15–0.35 rather than a sharp optimum (D21). The level of the high state falls
+    with p faster than √area, while rises come sooner.
+  - At fixed γ = 0.03, γ·S_high falls from 3.4 to 2.6 over p = 0.15–0.3 (about 0.9 at 0.35), so the
+    1/γ scaling of D20 leaves a strong dependence on p.
+- **Caveats:**
+  - Two seeds per p, and one or two runs per Q4 cell. Time spent high differs as much between seeds as
+    between settings.
+  - At p = 0.35 the runs flicker between about 10 and 80 species with no separate high mode, so their
+    % high and level while high rest on the lines borrowed from p = 0.3.
+
+#### 2026-11-17 16:01–16:16: every checkpoint in one zip, campaign included (`session 2026-11-17`, `tools/prune_checkpoints.py`)
+- **Why (recorded):** the project moves to another PC. The request was one clean zip of every
+  checkpoint on this PC, those on `E:` included, placed in `checkpoints/`.
+- **Done:** `tools/prune_checkpoints.py "checkpoints/*" "E:/MasterProject/checkpoints/*" --into
+  E:/MasterProject/export_20261117/checkpoints --zip`. A new folder was used so nothing from the
+  5 Nov export could slip in. The zip was then moved to `checkpoints/checkpoints_20261117.zip` and
+  every entry was tested again there. The sources were left untouched, and every patch count was
+  already recorded.
+- **Result:**
+  - 22 top folders: the 20 on D:, the campaign of 9 Nov and the switch capture.
+  - 1.3 GB of the 102 GB of snapshots are kept. The campaign kept 1,055 of 86,498 snapshots.
+  - All 191 replay checks were exact.
+  - The zip holds 3,565 files (2.2 GB unpacked) in 973 MB.
+- **What it changes:** on the other PC, unzip at the project root. `analysis/campaign_runs.py`
+  (`CAMPAIGN`, `CHECKPOINTS`) and the `CHECKPOINTS` cell of `sim_analysis.ipynb` still point at
+  this PC's absolute paths.
+
 ---
 
 ## 2. Register of discoveries
@@ -520,8 +753,8 @@ do in the paper?
 | D3 | ~~Blocked sites raise diversity when all cycles are allowed (γ = 0.15: 7 → 52 species as p goes 0.075 → 0.2)~~ | Withdrawn 5 Nov: mostly species in cut-off pockets; the largest cluster held 3–5 species for p ≤ 0.15 and 17 at p = 0.2 | 28 Sep | `run gamma_15_alpha_0125_perc_*` (removed 5 Nov) |
 | D4 | A habitat broken into pockets creates spurious diversity, even when the pockets are single sites; hence the largest-cluster rule | Established (methodological) | 30 Aug / 7 Oct; 5 Nov | `run gamma_07_alpha_0125_perc_50` (removed 5 Nov; 2,603 of 2,604 species outside the largest cluster), `git 9798582` |
 | D5 | With cycles of length 2–6 rejected and p ≤ 0.1, diversity is lost at every γ from 0.02 to 0.12 | Established (44 runs) | 8 Oct | three sweeps, Phase III |
-| D6 | With 20–30% of sites blocked, high diversity returns at γ = 0.03 without short cycles (90–95 species), but not at γ ≥ 0.05, nor at p = 0.1 or 0.5 | Observed (1 run per cell; p = 0.2 and 0.3 agree) | 9 Oct | `run no_short_cycles_p_gamma_…` |
-| D7 | Hysteresis in α: at α ≤ 0.002 an established community persists, but fresh runs need α ≳ 0.008–0.012 to become diverse | Observed (2 siblings + 3 fresh runs per α) | 23 Oct | `nb sim_analysis §2–7` |
+| D6 | With 20–30% of sites blocked, high diversity returns at γ = 0.03 without short cycles (90–95 species), but not at γ ≥ 0.05, nor at p = 0.1 or 0.5 | Observed (1 run per cell; p = 0.2 and 0.3 agree). Refined 12 Nov by D21 (2 seeds per p) | 9 Oct | `run no_short_cycles_p_gamma_…` |
+| D7 | Hysteresis in α: at α ≤ 0.002 an established community persists, but fresh runs need α ≳ 0.008–0.012 to become diverse | Observed (2 siblings + 3 fresh runs per α). Revised 12 Nov (D22): the persistence was a slow clock; 4 of 6 low-α communities collapsed and none came back, so the hysteresis lies in the way up | 23 Oct | `nb sim_analysis §2–7`, `nb campaign_analysis §5` |
 | D8 | A community's fate is largely chance: sibling branches diverge, and the unchanged control drops from 100% to 51% of its time high | Established for these runs | 23 Oct | `nb sim_analysis §7, §11` |
 | D9 | γ swap from a diverse state: only γ = 0.02 holds, 0.035–0.05 flicker, γ ≥ 0.055 is lost, and at γ ≥ 0.05 the starting state is forgotten | Observed (1 run per γ) | 23 Oct | `nb sim_analysis §10–12` |
 | D10 | The diverse state is a flow of newcomers, not a stable assembly: no species alive at a branch survives 100M, and 73% of peak species are under 1M steps old | Established (all branches) + Observed (capture) | 23 Oct / 31 Oct | `nb sim_analysis §9`, `nb switch_analysis §7` |
@@ -530,11 +763,22 @@ do in the paper?
 | D13 | Without short cycles, patches form by linear chain relays whose follower cannot invade the original species; collapses are relays that erase islands. Travelling bands in the videos are such chains, not 2-cycles | Observed (5 events) | 31 Oct; 4 Nov | every-step videos; replay at 153,949,554 |
 | D14 | Cycles in Γ track the species count (a large cycle-connected group appears near S ≈ 1/γ), and about 80% of states are frozen, so cycles in Γ are rarely active on the lattice | Observed (1 capture) | 31 Oct | `nb switch_analysis §6` |
 | D15 | The cost of rejecting short cycles explodes with γ and species count (γ = 0.2 is unreachable at 99 species) | Observed (technical) | 22 Oct | `session 2026-10-22` |
+| D16 | D3 in a weak form: with all cycles allowed and the largest cluster only, blocked sites keep γ = 0.07 in its high state (p = 0.1–0.3: no collapse, against three in 50M at p = 0) and add species at γ = 0.15 (3.5 → 17.5 as p goes 0 → 0.3). Whether γ = 0.15 at p = 0.2–0.3 is a high state is unresolved by the mode rule | Observed (1 run per cell) | 11 Nov | `nb campaign_analysis §1, §4` |
+| D17 | γ acts through link density, not through the arrival rate α·γ. From parent B, a higher rate at γ = 0.03 kept 4 of 4 runs high (68–87 species), while a higher γ at a fixed rate lost diversity (never high in the second half at γ ≥ 0.07). The rate sets the time spent high: at γ′ = 0.04–0.05 the γ swap was high 64–84%, the fixed-rate arm 9–15% (as Uekermann et al. 2017 found for α) | Observed (1 run per cell) | 11 Nov | `nb campaign_analysis §2` |
+| D18 | At p = 0 in the full dynamics, starting from one species, rejecting even cycles of length 2–4 stops diversity forming at γ = 0.05, where all cycles allowed rose at 31.6M. The paper's quasistatic runs gained diversity from that rejection | Observed (1 run per cell, 50M) | 11 Nov | `nb campaign_analysis §3` |
+| D19 | The high state's level depends strongly on the setting: high modes of 113, 108, 92 and 85 species at p = 0.15, 0.2, 0.25 and 0.3 (γ = 0.03, 2–6 rejected), 84 (all cycles, γ = 0.05) and 36–40 (all cycles, γ = 0.07–0.09); the low mode is 1.5–6 species everywhere. Fixed lines at 10 and 50 species misclassify the all-cycles runs at γ ≥ 0.07 | Established (74 pools, 201 runs; updated 12 Nov) | 11 Nov | `nb campaign_analysis §1` |
+| D20 | The high state's level scales roughly as 1/γ: γ·S_high = 2.5–4.2 for every high mode in D19, while S_high spans 36–108. Each species can then invade about three living species | Observed (the D19 modes; the settings also differ in p and cycle rule) | 12 Nov | D19, 12 Nov entry |
+| D21 | At γ = 0.03 with lengths 2–6 rejected, fresh runs reach the high state for p = 0.15–0.35 but not at p ≤ 0.1 or 0.4 within 100M. Within that window the high state's level falls with p (median 104–119 → about 30 species), also after √area scaling, while first rises come sooner (11–42M → 1–12M). Time spent high varies as much between seeds as with p | Observed (2 seeds per p) | 12 Nov | `nb campaign_analysis §6` |
+| D22 | The high state is metastable at every α. At α ≤ 0.002, 4 of 6 communities collapsed (6–213M after the branch) and none came back in 87–165M; at α = 0.0125 they collapse too, but parent B's rose again four times within 1–14M. Counted in arrivals, low α shortens the high state rather than lengthening it (370–12,800 arrivals against 7,400–28,700 and more) | Observed (1–2 runs per cell, two parents) | 12 Nov | `nb campaign_analysis §5` |
 
 **Relation to the paper.** D1, D2, D5 and D11 agree with it. D6 and D13 qualify its conclusion. In a
 habitat with blocked sites, high diversity arises at low γ with no cycle shorter than 7, and the patch
 creation observed so far runs through linear chain relays. The paper found chains alone insufficient
 on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their role is not excluded.
+D18 departs from its Fig. 6. There, rejecting cycles of length 2–4 raised diversity; in our full
+dynamics from one species, the same rejection prevented it. The starts differ: the paper began from a
+diverse state. D17 agrees with Uekermann et al. (2017), for whom γ sets which states are available and
+α the time spent in them. The papers are in `articles/`.
 
 ---
 
@@ -550,18 +794,28 @@ on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their
   - Blocked sites also shield islands from later sweeps.
   - *Test:* how island survival depends on distance to blocked sites; and how often relays leave
     islands at p = 0 compared with p = 0.3.
-- **Q3. Is there an optimum in p?** No diversity at 0.1, high at 0.2–0.3, none at 0.5. This needs a
-  finer grid in p with replicates, ideally compared at equal habitat size, since the largest cluster
-  shrinks as p rises.
-- **Q4. Is the hysteresis in α real bistability, or just too little time?** This needs longer runs, more
-  independent parents, and a control that keeps α = 0.0125.
-- **Q5. Does γ act through link density or through the arrival rate α·γ?** Separate the two by varying
-  γ while holding α·γ fixed.
+- **Q3.** Answered 12 Nov: a window of p = 0.15–0.35 rather than a sharp optimum, with the highest
+  high state at its low end and the fastest rises at its high end (D21; see the 12 Nov 10:56 entry).
+  Comparing the time spent high across p would need more seeds.
+- **Q4.** Answered 12 Nov: slow decay, not bistability. The high state is metastable at every α, and
+  the hysteresis lies in the way up (D22; see the 12 Nov 10:56 entry, which also compares lifetimes
+  in arrivals).
+- **Q5.** Answered 11 Nov: γ acts through link density (D17; see the 11 Nov entry).
 - **Q6. Does the follower relation predict the direction of a switch?** Compare the share of relays
   that leave islands with the share that erase them, over many rises and collapses.
 - **Q7. Comparison with paper Fig. 6.** Our rejection allows cycles from length 7, in the full
   dynamics, whereas the paper's runs were quasistatic. Is the difference in outcome at p = 0 due to the
   dynamics, or only to the rejection threshold?
+  - *Running since 9 Nov:* `q7_threshold_p0`, which covers the threshold half.
+  - *11 Nov:* the threshold alone does not explain the gap (D18). Still open:
+    - the quasistatic half;
+    - runs that start, as the paper's did, from a diverse state with Γ cleared.
+- **Q8. Is a switch a noise-driven escape in a two-variable system?** (frame of 12 Nov) *Tests:*
+  - dwell times in each state are exponential;
+  - counted in arrivals, switching rates depend on α only through the overlap ε = α·γ·τ_sweep;
+  - the drift in (S, F), estimated from the pooled `analysis.npz` series, has two stable zeros and
+    circulates, so rise and collapse take different paths;
+  - the per-arrival event probabilities, measured on the capture, reproduce that drift.
 
 ---
 
@@ -583,8 +837,10 @@ on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their
   count. Only runs whose usable sites form one cluster are kept.
 - **Two switch detectors:**
   - The simulator keeps snapshots around swaps found with thresholds relative to each run's own level.
-  - The notebooks count regimes with fixed thresholds of 10 and 50 species.
-  - The two do not always agree.
+  - `sim_analysis.ipynb` counts regimes with fixed thresholds of 10 and 50 species.
+  - Since 11 Nov, `campaign_analysis.ipynb` takes the lines from the modes of alike runs instead
+    (D19): in above 0.5·M1, out below 0.1·M1 (Uekermann et al. 2017).
+  - These do not always agree. Fixed lines suit only settings whose high mode is near 100 species.
 - **Cycle counts above length 4** are sampled estimates, and counts sum over snapshots.
 - **Speed changes are verified bit-exact:** every kernel change is checked against full trajectories,
   including the random-number state.
@@ -592,6 +848,10 @@ on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their
   calls, so replaying from a saved snapshot reproduces the run exactly. Since 5 Nov only one snapshot
   per million is kept, and a rebuild costs up to about 13 minutes.
 - **Plotting:** one colour and marker per run, kept fixed, and no means over n ≤ 3 sibling runs.
+- **CPU:** on this PC more than about 16 runs at once (one per physical core) slows every run without
+  adding steps in total.
+- **Running runs:** do not open a running run's files. Windows cannot replace or delete a file
+  another process holds open, so the run stops with an error.
 
 ---
 
@@ -603,8 +863,9 @@ on an unblocked lattice. Cycles of length ≥ 7 are still allowed here, so their
 | Sweeps and grids (Oct) | `checkpoints/gamma_sweep_perc05_largest_…`, `checkpoints/no_short_cycles_*` |
 | Fresh α runs r3–r5 (analysis records only) | `checkpoints/alpha_p20_g003_fresh_rep3-5_analysis` |
 | Switch capture, features and videos | `E:\MasterProject\checkpoints\switches_p0.3_a0.0125_g0.03_20261029_150918_cd0568f6` |
-| All of the above, one snapshot per million (5 Nov) | `E:\MasterProject\export\checkpoints` and `checkpoints.zip` beside it; unzip at the project root elsewhere |
-| Analyses | [analysis/sim_notebook.ipynb](analysis/sim_notebook.ipynb), [analysis/sim_analysis.ipynb](analysis/sim_analysis.ipynb), [analysis/switch_analysis.ipynb](analysis/switch_analysis.ipynb) |
+| Campaign of 9 Nov (45 runs: Q3–Q5, Q7, D3) | `E:\MasterProject\checkpoints\campaign_20261109_161426_f78322dc`; plan, status and log inside |
+| All of the above, one snapshot per million (17 Nov) | `checkpoints/checkpoints_20261117.zip` (973 MB), unzipped copy in `E:\MasterProject\export_20261117\checkpoints`; unzip at the project root elsewhere. The 5 Nov export in `E:\MasterProject\export` lacks the campaign |
+| Analyses | [analysis/sim_notebook.ipynb](analysis/sim_notebook.ipynb), [analysis/sim_analysis.ipynb](analysis/sim_analysis.ipynb), [analysis/switch_analysis.ipynb](analysis/switch_analysis.ipynb), [analysis/campaign_analysis.ipynb](analysis/campaign_analysis.ipynb) (campaign of 9 Nov) |
 
 ---
 
