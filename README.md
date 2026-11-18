@@ -246,6 +246,76 @@ max_workers=4, initial_state=original_shared_state)`. The starting state is
 needed only for branched jobs without a checkpoint; the sweep command supplies
 it automatically.
 
+### Queue a campaign of different runs
+
+`tools/run_campaign.py` runs many unrelated runs (fresh starts, branches of
+different parents, continuations) on a fixed number of CPU slots. Each run is
+one child process:
+
+- a **one-job batch**, with its own `batch_plan.json`, seed and job folder,
+  started by `run_simulations` and continued by `resume_simulations`;
+- or, for mode `continue`, an **exact continuation** of an earlier run into a
+  new folder. The saved random state is restored and the source's history is
+  carried, so the new folder holds the source run's own trajectory.
+
+The scheduler keeps `--slots` children running in the plan's order, so a slot
+freed by a finished run goes straight to the next one. On this PC (16 cores,
+32 threads) about 16 runs at once give the most steps per hour; 24 make every
+run slower without more in total. A child that stops with an error is started
+again from its newest checkpoint, up to `--max-attempts` times. That is exact,
+and repeats at most one tracking interval. Children run at below-normal
+priority, so the machine stays responsive.
+
+```powershell
+.\MSvenv\Scripts\python.exe tools/run_campaign.py --dry-run
+.\MSvenv\Scripts\python.exe tools/run_campaign.py --detach
+.\MSvenv\Scripts\python.exe tools/run_campaign.py --status E:/MasterProject/checkpoints/CAMPAIGN
+.\MSvenv\Scripts\python.exe tools/run_campaign.py --stop E:/MasterProject/checkpoints/CAMPAIGN
+.\MSvenv\Scripts\python.exe tools/run_campaign.py --resume E:/MasterProject/checkpoints/CAMPAIGN --detach
+```
+
+The campaign it defines is the one started on 2026-11-09 (`campaign_groups()`,
+described in `RESEARCH_LOG.md`). The dry run checks every starting state
+against the fingerprint its earlier batches recorded. `--detach` starts the
+scheduler through WMI, outside the terminal's process tree, so it keeps
+running when the terminal or editor closes. Without it the scheduler runs in
+the foreground, and Ctrl+C stops it and its runs. `--stop` asks a detached
+scheduler to stop its runs within a poll (20 s). Writing a number to
+`CAMPAIGN/SLOTS` changes the slot count of a running scheduler.
+
+| Output | Contents |
+|---|---|
+| `campaign_plan.json` | Questions, sources (path, copy, fingerprint) and every run's settings, seed root, start and target. |
+| `campaign_status.json` | Each run's state, attempts, newest checkpoint and speed, updated every 5 minutes. |
+| `campaign.log`, `logs/` | The scheduler's log, and one log per run. |
+| `initial_states/` | Copies of the starting checkpoints, used if the originals are gone. |
+| `<group>/<label>/` | One run: a one-job batch folder, or a continuation's run folder. |
+
+Status reads only file names. **Do not open a running run's files** (for
+example its `analysis.npz` in a notebook). Windows cannot replace or delete a
+file that another process holds open, so the run stops with an error. The
+scheduler then restarts it, but that costs one of its attempts. Read a run's
+files once it is done.
+
+`analysis/campaign_analysis.ipynb` analyses the 2026-11-09 campaign, which
+finished on 2026-11-12 with all 45 runs done. Part 1 defines the high and low
+states; then there is one part per question (Q5, Q7, the D3 redo, Q4, Q3), each
+with the question, how it was tested, figures and a short conclusion. Its
+loader, `analysis/campaign_runs.py`, reads `campaign_status.json` and opens only
+the runs marked done, so it is also safe to use while a campaign runs.
+
+High and low states come from the modes of alike runs, after Uekermann,
+Mathiesen & Mitarai, Phys. Rev. E 95, 032409 (2017), §III B
+(`articles/PhysRevE.95.032409.md`). `campaign_runs.catalogue` gathers every
+finished run, from the campaign and the earlier batches. `state_lines` pools
+runs with the same γ, p and cycle rule, over α, seed and parent, and finds the
+modes of their living-species distribution. A pool whose high mode M1 lies
+more than ten times above its low mode gets the paper's lines: a run enters the
+high state above 0.5·M1 and leaves it below 0.1·M1. Other pools borrow the
+lines of the nearest such pool with the same cycle rule (same p, else same γ).
+A pool with no such neighbour is "low only" if all its modes lie below every
+exit line, and "unresolved" otherwise.
+
 ## Percolation without short directed cycles
 
 Set `max_forbidden_cycle_length=6` to exclude directed cycles of lengths
@@ -517,15 +587,17 @@ top, and tests every entry's checksum before naming it. To gather everything on
 one machine for another:
 
 ```powershell
-python tools/prune_checkpoints.py "checkpoints/*" "E:/MasterProject/checkpoints/*" --into E:/MasterProject/export/checkpoints --zip
+python tools/prune_checkpoints.py "checkpoints/*" "E:/MasterProject/checkpoints/*" --into E:/MasterProject/export_20261117/checkpoints --zip
 ```
 
-Unzip the archive at the project root of the other machine, so the run folders
-land in its `checkpoints/`. `--every` changes the block size. On 2026-11-05,
-after the runs with cut-off pockets were removed, this kept 843 MB of the
-67.1 GB of snapshots, and all 146 replay checks matched. The copy, with records,
-plans, capture features and videos, holds 2,370 files (1.8 GB), and the zip is
-933 MB.
+Gather into a new folder each time: the tool refuses a destination that holds
+files the gather does not cover. Unzip the archive at the project root of the
+other machine, so the run folders land in its `checkpoints/`. `--every` changes
+the block size. On 2026-11-17, with the campaign of 9 Nov and the switch
+capture included, this kept 1.3 GB of the 102 GB of snapshots, and all 191
+replay checks matched. The copy, with records, plans, capture features and
+videos, holds 3,565 files (2.2 GB). The zip is 973 MB and sits in
+`checkpoints/checkpoints_20261117.zip`.
 
 ## Continue or change rules
 
