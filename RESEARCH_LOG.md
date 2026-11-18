@@ -742,6 +742,85 @@ do in the paper?
   (`CAMPAIGN`, `CHECKPOINTS`) and the `CHECKPOINTS` cell of `sim_analysis.ipynb` still point at
   this PC's absolute paths.
 
+#### 2026-11-18 13:40: a one-variable drift model built from the two loops (`session 2026-11-18`)
+- **Why (recorded):** "how I can begin creating a mathematical model for this lichen simulation."
+  The starting idea was stated as two loops:
+  - followers create patches and patches create diversity, which happens more often at high
+    diversity;
+  - a dominant species lands and clears out patches, which happens more often at low diversity;
+  - both happen in either state, "so given enough time the counter feedbackloop will happen enough
+    for a system switch". The two loops are to be described in more depth afterwards.
+- **Done:** no new runs. The model was worked out step by step in a tutoring session, starting from
+  the one-variable core of the 12 Nov frame.
+- **The model (hypothesis):**
+  - **Clock and state:** arrivals, n = α·γ·t, and the species count S.
+  - **Bookkeeping:** each arrival adds exactly one species, because a newcomer always takes the site
+    it lands on. Every extinction, the newcomer's own included, counts as a loss. The drift is then
+    f(S) = E[ΔS per arrival | S] = 1 − c(S), with c(S) the mean extinctions per arrival.
+  - **Cascades:** a sweep is one species taking over the ground of one prey species. Each sweep sets
+    off m new sweeps on average (a branching process), so a cascade holds 1/(1 − m) sweeps on
+    average. m depends on S only through γ·S and reaches 1 at γ·S = K.
+  - **Islands:** a sweep wipes its prey out with probability r (0 ≤ r ≤ 1); otherwise the prey keeps
+    islands. Hence c(S) = r(S) / (1 − γS/K).
+  - **With r constant:** one stable crossing, at γ·S* = K(1 − r). It does not depend on γ, which is
+    the 1/γ scaling of D20. The drift of γ·S_high with p (3.4 → 2.6 over p = 0.15–0.3) must then sit
+    in K, r or both.
+  - **With r(S) falling:** r near 1 while the lattice is one big patch, dropping as it breaks up, and
+    levelling off at a floor above 0. Then c starts at 1, rises, dips below 1 and rises to infinity
+    at S_c = K/γ. That gives three fixed points:
+    - a stable low state near S = 1, where sweeps on an unfragmented lattice remove whole species;
+    - an unstable point where fragmentation pulls r down (the fragmenting loop);
+    - a stable high state where cascades take over.
+  - **Bistability is not guaranteed:** three fixed points need r(S) to fall fast enough in the
+    middle. This may be why some settings never reach a high state (hypothesis, not tested).
+- **What it changes:**
+  - The fragmenting loop enters as a fall in r, inside the loss term, rather than as a gain.
+  - r(S) (the share of sweeps that leave no islands) and m(S) (new sweeps per sweep) can be measured
+    with the relay classifier of Q1 and Q6. The level of the high state alone cannot separate K and
+    r, since it fixes only K(1 − r) ≈ 3.
+- **Still open:** the noise σ²(S) and the escape times (the "given enough time" part); the low fixed
+  point in detail; a second variable F for patchiness first (D11).
+
+#### 2026-11-18 16:06: noise and escape from a well; where the session stopped (`session 2026-11-18`)
+- **Why (recorded):** after the 13:40 entry the next step chosen was noise and switching: the "given
+  enough time the counter feedbackloop will happen enough" part of the starting idea. The session ran
+  as tutoring, "slowly, I dont want the answear given, just point me in the right direction".
+- **Worked out:**
+  - **Why noise is needed:** the drift alone never switches, since it always pushes back into the
+    well. Switches come from the scatter of single arrivals: ΔS = 1 − (extinctions), with mean f(S)
+    and variance σ²(S).
+  - **What a collapse needs:** a run of large losses that carries S from S* down to S_u against the
+    drift. Past S_u the drift finishes the job.
+  - **What sets the odds:** escape is harder with a larger distance d = |S* − S_u| and a stronger
+    drift |f|, and easier with larger noise σ². Parameters act only through these features. In
+    arrivals, α drops out to first order (it converts arrivals into t), though D22 suggests there is
+    more to it.
+  - **One number:** the units (f in species per arrival, σ² in species² per arrival, d in species)
+    combine into d·|f|/σ². This is the barrier ΔU. For varying f and σ², ΔU = ∫ 2|f|/σ² dS from
+    S_u to S*, the same integral as in P(S) ∝ exp(∫ 2f/σ² dS).
+  - **Step 1, a run of bad luck (done):** k unlucky arrivals in a row, each with probability q, have
+    a chance q^k, so the mean wait is (1/q)^k. The depth adds while the wait multiplies.
+  - **Step 2, real step sizes (done):**
+    - Over N arrivals, ΣΔS ≈ Normal(N·f, N·σ²), because variances of independent arrivals add.
+    - Escape needs ΣΔS ≤ −d, so the noise must supply d + N·f. That gives
+      P_N ≈ exp(−(d + N·f)² / (2N·σ²)).
+    - The exponent is smallest at N* = d/f, where P* ≈ exp(−2·d·f/σ²) = e^(−ΔU).
+    - Worked example: d = 30, f = 0.1, σ² = 1 gives N* = 300 and ΔU = 6.
+- **Where the session stopped (to resume on another PC):**
+  - **Step 3, the waiting time:** presented in outline but not worked through. Each arrival has
+    about the same small chance C·e^(−ΔU) of starting a successful escape. The time in a well is
+    then memoryless, P(T > n) ≈ e^(−n/τ) with τ ≈ C⁻¹·e^(ΔU) (Kramers' escape rate). Q8's first test,
+    exponential dwell times, comes from this.
+  - **Question posed, not yet answered:** an escape lasts about N* = d/f arrivals, while the wait
+    before it is about e^(ΔU) arrivals. What does that say about the question in
+    `RESEARCH_QUESTIONS.md` of why switches are sharp rather than a random drift?
+  - **Caveat to carry:** step 2 assumes many small independent steps. Losses are heavy-tailed (one
+    relay removed 9 species at 164.03M), so large jumps may cut across the hill and make escapes more
+    frequent than e^(−ΔU) predicts.
+  - **Directions offered for later:** the low fixed point in detail (c near S = 1–3), and measuring
+    f(S) and σ²(S) from the `analysis.npz` series to test the shape of the drift.
+  - **How the session ran:** one step and one question per turn, with hints rather than answers.
+
 ---
 
 ## 2. Register of discoveries
@@ -816,6 +895,11 @@ diverse state. D17 agrees with Uekermann et al. (2017), for whom γ sets which s
   - the drift in (S, F), estimated from the pooled `analysis.npz` series, has two stable zeros and
     circulates, so rise and collapse take different paths;
   - the per-arrival event probabilities, measured on the capture, reproduce that drift.
+  - *18 Nov:* a one-variable version with mechanisms, f(S) = 1 − r(S)/(1 − γS/K) (see the 18 Nov
+    entry). *Test:* measure r(S) and m(S) per relay with the classifier, and compare the drift they
+    give with the one measured from the series. *18 Nov, later:* the escape over the barrier,
+    ΔU = ∫ 2|f|/σ² dS and τ ∝ e^(ΔU), was worked through up to the waiting time (see the 16:06
+    entry).
 
 ---
 
