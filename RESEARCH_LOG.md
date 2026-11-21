@@ -821,6 +821,90 @@ do in the paper?
     f(S) and σ²(S) from the `analysis.npz` series to test the shape of the drift.
   - **How the session ran:** one step and one question per turn, with hints rather than answers.
 
+#### 2026-11-19 10:06: the waiting time, and why switches look sharp (`session 2026-11-19`)
+- **Why (recorded):** "let's continue with point 3", resuming the 18 Nov 16:06 entry at step 3.
+- **Worked out:**
+  - **Per arrival:** each arrival starts a successful escape with a small probability
+    p = C·e^(−ΔU). C collects everything step 2 left out: tail against point probability, escape
+    lengths near N*, and the curvature of U at the well bottom and the hilltop. Overlapping stretches
+    are treated as independent, which holds while p is small.
+  - **Survival:** with T the first arrival that starts an escape, P(T > n) = (1 − p)^n.
+  - **Memoryless:** P(T > n + m | T > n) = (1 − p)^m, whatever n is. The system has no clock for how
+    long it has been in the well.
+  - **Exponential:** (1 − p)^n = e^(n·ln(1 − p)) ≈ e^(−np) = e^(−n/τ), with τ = 1/p = C⁻¹·e^(ΔU). τ is
+    the mean dwell time, since E[T] = Σ (1 − p)^n = 1/p. This is Kramers' escape rate, 1/τ.
+  - **Two time scales:** the escape lasts N* = d/f arrivals, while the wait is τ ∝ e^(ΔU) with
+    ΔU ≈ 2·d·f/σ². A larger distance d raises both, but the wait grows exponentially. A stronger drift
+    shortens the escape and lengthens the wait.
+- **Answer to the sharpness question of `RESEARCH_QUESTIONS.md` (hypothesis), in the user's words:**
+  "N* is quite short compared to tau ... which makes the switches sudden and randomly scattered
+  throughout S(t)". The long dwells are also why P(S) is bimodal (D19): intermediate S is visited only
+  in transit.
+- **Rough check with numbers already in this log** (375 arrivals per 1M at α = 0.0125, γ = 0.03):
+  - The captured rise and collapse each took about 3.2M steps, about 1,200 arrivals.
+  - Dwells range from about 500 arrivals (first rises after 1.3M at p = 0.25–0.35) to 2,700 (the
+    capture's high state), 7,400 and 28,700 (the α = 0.0125 controls of D22), and over 37,500.
+  - So the separation holds for most dwells, but only by a factor of about 2–30, and the shortest
+    dwells are no longer than a transit.
+- **When switches should stop looking sharp (worked out by the user):** when the drift is weak or the
+  wells are close, τ shrinks toward N* and S(t) wanders. Two predictions, checked against the log:
+  - **Higher p:** a fragmented lattice makes the fall in r(S) less extreme, and the high state sits
+    lower (D21), so d shrinks too. Both lower ΔU. This matches p = 0.35 at γ = 0.03, whose runs flicker
+    between about 10 and 80 species with no separate high mode.
+  - **Lower γ:** if f(S) stretches along S by 1/γ at the same height and noise (D20 supports the
+    stretch; the height and σ² are untested), d and ΔU grow as 1/γ. From γ = 0.03 to 0.02, N* grows
+    1.5 times and τ about e³ ≈ 20 times, so switches become rarer and sharper. This matches the
+    γ swap (D9): γ = 0.02 stayed high throughout, 0.035–0.05 kept switching, and γ ≥ 0.055 lost the
+    high state within 0.5–0.8M.
+  - The user's first guess, that a lower γ would make switches more drift-like, was corrected in the
+    session. Stretching the axis lowers the slope of f but not its size, and ΔU depends on the size
+    and the distance.
+- **Still open:** the low fixed point in detail; measuring f(S) and σ²(S) from the `analysis.npz`
+  series; testing exponential dwell times (Q8).
+
+#### 2026-11-19 12:50: a stochastic toy of the drift model (`session 2026-11-19`, `nb analysis/sim_manual_analysis.ipynb`)
+- **Why (recorded):** "Do we have what we need, if I want to create a toy math model of this system
+  driven on just random noise?" The user then built it in the notebook.
+- **The toy:** one step per arrival.
+  - **Cascade:** generation by generation, Z_{k+1} ~ Poisson(m·Z_k) from Z_0 = 1, with
+    m = min(γS/K, 0.999). The cascade size N is the sum of the Z_k.
+  - **Loss:** L = min(S, Binomial(N, r(S))), then S → S + 1 − L.
+  - **Islands:** r(S) = r_min + (1 − r_min) / (1 + e^((S − S_half)/ρ)).
+  - **Level:** K = 3/(1 − r_min), so that S* = 100 at γ = 0.03.
+  - **Consistency:** the mean loss is r/(1 − m) = c(S), so the noise reproduces the drift of the
+    13:40 entry (18 Nov).
+- **Findings (toy; a few seeds each, measured on a scratch copy of the notebook's model):**
+  - **The high state sits at m* = 1 − r_min.** With r_min = 0.01 (S_half = 60, ρ = 2) it is 1% from
+    runaway cascades. It collapsed after 132 and 674 arrivals, each time through single cascades
+    that removed 14–37 species. The clamp on m also lets S overshoot S_c. Real collapses took about
+    1,200 arrivals, through relays of 6–9 species.
+  - **The low state absorbs when r ≈ 1 at low S.** At S = 1 every arrival then adds one species and
+    removes one. From S = 1 the run never left 1 in 20,000 arrivals (S_half = 60, ρ = 2). At
+    S_half = 50, ρ = 10, r_min = 0.2 it reached at most 6 in 100,000 arrivals; started at S = 100 it
+    collapsed once and never returned.
+  - **A bug, fixed:** a fresh generator with the same seed inside each function call removed all the
+    noise. One generator per run fixed it.
+  - **Switches both ways** at S_half = 20, ρ = 5, r_min = 0.15 (seed 123):
+    - 99 crossings of S = 50 in 100,000 arrivals, 41% of the time high;
+    - while high, a mean of 94 and an sd of 11.7 (5–95%: 71–110), skewed down by big cascades;
+    - at r_min = 0.3 and 0.5 the sd was 8.8–9.1, but there were only 3 and 1 crossings.
+  - **Width of the high state (derived in the session, hypothesis):**
+    - Var(S) ≈ σ²(S*) / (2|f′(S*)|), the linear-noise (Ornstein–Uhlenbeck) approximation.
+    - With K(1 − r_min) = 3, the noise (about 1/r_min) and the restoring slope cancel, leaving
+      Var ≈ 3(1 + r_min)/(2γ): an sd of about 8 at γ = 0.03, whatever r_min is.
+    - The excess at small r_min is the heavy tail, and the same cascades cause the collapses.
+  - **Less dispersed cascades:** each sweep sets off Binomial(k, m/k) new sweeps, which keeps the mean
+    m. With k = 4 the high-state sd was 10.2, with 80 crossings.
+  - **The notebook's current settings** (k = 1, r_min = 0.1) are not yet measured. With k = 1 each
+    sweep sets off at most one new sweep, so a cascade is a single relay chain of geometric size.
+- **Where the session stopped:**
+  - **Not yet answered:** derive f′(S*) = −(γ/K)/r_min and see why raising r_min hardly narrows the
+    high state.
+  - **The target width:** measure the spread of S while high in the campaign runs, or the width of
+    the high peak in D19, as the target for the toy.
+  - **Still missing:** a low-state mechanism. r near 1 at low S makes the low state absorbing.
+    D12's 14–18% establishment in the low state could calibrate a ceiling r_max < 1.
+
 ---
 
 ## 2. Register of discoveries
@@ -899,7 +983,8 @@ diverse state. D17 agrees with Uekermann et al. (2017), for whom γ sets which s
     entry). *Test:* measure r(S) and m(S) per relay with the classifier, and compare the drift they
     give with the one measured from the series. *18 Nov, later:* the escape over the barrier,
     ΔU = ∫ 2|f|/σ² dS and τ ∝ e^(ΔU), was worked through up to the waiting time (see the 16:06
-    entry).
+    entry). *19 Nov:* the waiting time is done. Dwell times are memoryless with mean τ = C⁻¹·e^(ΔU),
+    and the escape lasts N* = d/f ≪ τ, which would make switches sharp (see the 19 Nov entry).
 
 ---
 
