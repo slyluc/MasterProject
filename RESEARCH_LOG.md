@@ -1021,6 +1021,88 @@ do in the paper?
   - the phase plane;
   - measuring q(p) and b(p) per sweep in the simulations.
 
+#### 2026-11-26: the (S, F) phase plane, and noise in two variables (`session 2026-11-26`, `nb analysis/sim_manual_analysis.ipynb` cells 6–15)
+- **Why (recorded):** "I have defined all important equations that we have logged in the research
+  log, but now I want to plot phase spaces". This works through the "phase plane" item left open on
+  25 Nov. Tutoring, no new runs. All of it is hypothesis.
+- **q(F, p):**
+  - The user's form is q = q₀·(1 − p/p_c)·(1 − (F − 1)/(F_c − 1)). It falls with p (blocked sites
+    stop sweeps) and with F (other species' ground stops them). Fragmentation therefore lowers
+    r = q^F twice: through the exponent and through q.
+  - The form is linear, so q reaches 0 at the thresholds. The user's reasons: p_c is the
+    percolation point of the open sites, about 1 − 0.593 ≈ 0.41 for random site blocking on a square
+    lattice, and the p ladder stops at 0.4; F_c is the largest F reached, near S_c. Outside those
+    ranges the form gives negative q, so the plotting grid must stay inside them.
+- **First check:** at p = 0, (S_low, F = 1) gives dS = 0 but dF = b(1 − q₀)/(q₀·S_low) > 0. Only G
+  survives at F = 1. So the 25 Nov low state on F = 1 is not a fixed point; F is pushed up.
+- **Fixed points reduce to one variable:** on the S-nullcline c = 1, so dF = (G − E)/S. A fixed point
+  needs **b·(1 − r(F)) = γ·a·(F − 1)**, islands made against islands eaten. S drops out.
+- **Parameters** (γ = 0.03, S_c = 110, q₀ = 0.97, F_c = 10, p_c = 0.41, p = 0):
+  - a = 0.5, b = 1.2: no fixed points. The gain is on top everywhere (erosion at most 0.12 against
+    a gain up to 1.2), so F always grows.
+  - a = 10, b = 1.1: three fixed points. Stability from the Jacobian:
+
+    | Point | S | F | Eigenvalues | Type |
+    |---|---|---|---|---|
+    | low | 8.4 | 1.28 | −0.0048, −0.0233 | stable |
+    | middle | 42.8 | 2.43 | +0.0009, −0.0313 | saddle |
+    | high | 92.4 | 4.08 | −0.0977, −0.0039 | stable |
+
+  - a = 10 means a sweep borders about 10 islands per unit of F − 1. That is a claim to measure,
+    not just a fitted value.
+- **Deterministic trajectories:** starts near the saddle split between the two states. A start at
+  (S, F) = (90, 1.7), next to the high state's S, ends in the low state. **S alone does not set the
+  basin;** a lattice with many species but few patches still collapses, in line with D11
+  (patchiness first). The boundary between the basins should be the saddle's attracting direction
+  (its stable manifold), the 2D version of the 1D hilltop S_u. It has not been traced yet.
+- **Noise, derived by the user:**
+  - Euler–Maruyama: the kick per step is σ·√dt, since variances of independent steps add, and the
+    spread after time T must be σ²T whatever dt is.
+  - σ_S ≈ 1 if extinctions per arrival were Poisson (variance = mean = c = 1 on the S-nullcline). This
+    is a lower bound, since cascades are heavy-tailed.
+  - F kicks scale as 1/S, from ΔF = (ΔP − F·ΔS)/S.
+  - The kicks are anti-correlated. One extra extinction (ΔS = ΔP = −1) gives ΔF = (F − 1)/S > 0:
+    losing a species with fewer patches than the average F raises the average. In code, S and F
+    share one normal draw with coefficient (1 − F)/S, and F gets a second, independent draw of
+    size σ_P/S for islands made and eaten.
+- **Noisy runs** (from the low state; S clipped to [1, 0.99·S_c], F to [1, F_c − 0.01]; 20,000
+  arrivals; seed 1):
+
+  | σ_S = σ_P | Runs reaching S > 70 |
+  |---|---|
+  | 1 | 0 of 8 |
+  | 2 | 0 of 8 |
+  | 3 | 3 of 8, first at 6,000–12,000 arrivals |
+
+  Some runs fall back after crossing. The notebook is left at σ = 3 with six starts. Whether F
+  climbs before S during a rise has not been examined yet.
+- **Issue found by the user: the low state vanishes for any p > 0.**
+  - The erosion line γ·a·(F − 1) starts at 0 at F = 1, while the gain starts at b·(1 − q(1, p)) > 0.
+    A low fixed point exists only if the line overtakes the gain just above F = 1, and that margin
+    is thin.
+  - In q, the factor (1 − p/p_c) multiplies q₀ directly. At F = 1 the gain rises from 0.033 at
+    p = 0 to 0.059 at p = 0.01, and the low crossing and the saddle are gone:
+
+    | p | Gain at F = 1 | Fixed points (S, F) |
+    |---|---|---|
+    | 0 | 0.033 | (8.4, 1.28), (42.8, 2.43), (92.4, 4.08) |
+    | 0.01 | 0.059 | (96.5, 4.22) |
+    | 0.1 | 0.293 | (107.4, 4.58) |
+    | 0.3 | 0.814 | (≈110, 4.67) |
+
+  - This contradicts the 25 Nov prediction (S_low rising with p, S_high falling) and the observed low
+    states of 3–5 species at p ≤ 0.1. The high state also rises with p, against D21.
+  - Candidate causes:
+    - q's p-dependence is too steep near F = 1;
+    - G counts every miss as new islands, though a missed patch makes none (the 25 Nov caveat that
+      G needs its own chance of leaving pockets, separate from 1 − q);
+    - E vanishes at F = 1.
+- **Still open:**
+  - the low state for p > 0 (above);
+  - tracing the separatrix;
+  - F against S in noisy rises (patchiness first);
+  - σ_S, σ_P and a from the simulations.
+
 ---
 
 ## 2. Register of discoveries
@@ -1106,7 +1188,10 @@ diverse state. D17 agrees with Uekermann et al. (2017), for whom γ sets which s
     switches (see the 22–25 Nov entry). *25 Nov:* a two-variable version with F = P/S,
     r = q^F and an F equation from islands made and eaten. It predicts a low state
     S_low = S_c(1 − q) and a barrier that closes as p rises. *Test:* measure q(p) and b(p) per sweep
-    (see the 25 Nov entry).
+    (see the 25 Nov entry). *26 Nov:* the phase plane with q(F, p) has two stable states and a saddle
+    at p = 0 (a = 10, b = 1.1), with the low state off F = 1 at (8.4, 1.28). For any p > 0 the low
+    state vanishes, against the 25 Nov prediction. G at F = 1 is the first suspect (see the 26 Nov
+    entry).
 
 ---
 
