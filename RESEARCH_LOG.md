@@ -905,6 +905,122 @@ do in the paper?
   - **Still missing:** a low-state mechanism. r near 1 at low S makes the low state absorbing.
     D12's 14–18% establishment in the low state could calibrate a ceiling r_max < 1.
 
+#### 2026-11-22 – 2026-11-25 10:25: the Gaussian barrier rederived, and where the CLT fails (`session 2026-11-22`)
+- **Why (recorded):** the session resumed the model on the new PC, with the user "a bit lost on the
+  definition of m = S/S_c and the derivation of exp(−ΔU)". The supervisor would like patchiness to
+  enter the model. It ran as tutoring, one step per turn. No new runs.
+- **Notation:** S_c = K/γ, so f(S) = 1 − r(S)/(1 − S/S_c) is the 18 Nov drift.
+- **m = S/S_c, the cascade's reproduction number:**
+  - About γS living species can invade the species that just swept, and K is roughly how many such
+    invaders it takes for one follow-up sweep. So m = γS/K = S/S_c, like R₀ in an epidemic.
+  - Generation k holds m^k sweeps on average, so a cascade holds 1 + m + m² + … = 1/(1 − m) sweeps.
+  - At the high state f = 0 gives **m* = 1 − r**: the high state sits below runaway cascades by the
+    island-survival margin. This is why the toy at r_min = 0.01 collapsed through huge cascades.
+- **Terms fixed in the session:**
+  - S_u is the unstable fixed point, f(S_u) = 0. It is the hilltop of the potential U(S) = −∫ f dS,
+    not of f. Valleys of U are the stable states.
+  - Between S_u and S*, f > 0 pushes S back up. It is 0 at both ends and largest in between. The
+    constant f of the derivation stands for its average over that stretch, which is why the general
+    barrier is ΔU = ∫ 2f/σ² dS from S_u to S*.
+  - Only S_u needs to be reached, not the low state. Past S_u the drift finishes the collapse.
+- **The barrier, rederived by the user with numbers** (d = 30, f = 0.1, σ² = 1):
+  - Over N arrivals the total has mean N·f and variance N·σ². Escape needs it at −d, a deviation of
+    d + N·f, which is z = (d + N·f)/(σ√N) standard deviations.
+  - z = 4.00 at N = 100, 3.46 at N = 300 and 4.11 at N = 1,000, so there is a cheapest length.
+  - Minimising z² gives N* = d/f = 300, where the noise supplies 2d (half for the distance, half
+    against the drift), and z*²/2 = 2df/σ² = ΔU = 6, so P* ≈ e^(−ΔU).
+- **The CLT, and where it fails here:**
+  - Means and variances add for independent arrivals, with no CLT needed. The cross term averages to
+    0 by independence, so the sd grows as √N. Correlated arrivals, where one cascade changes the
+    lattice for the next, would break this.
+  - Higher features add as well. The third central moment of the sum is N·κ₃, so its skewness is
+    κ₃/(σ³√N) and falls as 1/√N. Higher features fall faster, which leaves the Gaussian.
+  - The convergence is slow in the tails, which is where escapes happen. A single-arrival skewness of
+    −10, an illustrative value, still leaves −0.58 after N* = 300.
+  - Negative skew, from rare large cascades and frequent small additions, fattens the lower tail.
+    **Collapses are then more likely than e^(−ΔU) predicts.** This gives the reason behind the
+    heavy-tail caveat of 18 Nov.
+- **Prediction (hypothesis, worked out by the user):**
+  - In the low state the losses are capped at S (L = min(S, …)), so the steps are narrow and nearly
+    unskewed. Rises get no help from big jumps.
+  - **Collapses should be abrupt, through a few large cascades, and rises gradual, through many
+    small steps.**
+  - *Tests:* the distribution of ΔS per arrival while high and while low, and the shape of S(t)
+    through many rises and collapses. The one captured pair took about 1,200 arrivals each way, so
+    one event cannot show it.
+  - If rises cannot use big jumps in S, something else must carry them. With D11 (patchiness
+    first), this points to a second variable F driving rises.
+- **The first-passage route (discussed, not worked):** the supervisor suggested first passage instead
+  of the Gaussian argument.
+  - T(S), the mean arrivals to reach S_u, satisfies an exact equation found by conditioning on the
+    first arrival. It gives τ with its prefactor (Kramers) and the same exponent as the Gaussian.
+  - It can keep the real jump distribution. The exponent becomes ∫ θ*(S) dS, with θ* the nonzero root
+    of E[e^(θΔS) | S] = 1. For Gaussian steps |θ*| = 2f/σ². Heavy downward tails make it smaller.
+  - It is the test of Q8's exponential dwell times.
+- **Next:** patchiness in the model (a variable F, with r and K depending on it), then the barrier
+  with real jumps by first passage.
+
+#### 2026-11-25: patchiness as a second variable F (`session 2026-11-22`)
+- **Why (recorded):** "log it first, then let's do patchiness". The supervisor would like patchiness
+  in the model, and D11 (patchiness first) needs a second variable. Tutoring, no new runs. All of it
+  is hypothesis.
+- **The variable:** F = P/S, patches per species. The user first chose the largest patch's share,
+  but noted that it does not show whether a species is split. r depends on how the prey is spread,
+  so patches per species is the direct measure. F ≥ 1, with F = 1 meaning no islands.
+- **Islands in the drift:**
+  - q is the chance that a sweep, with any relay, reaches one given patch of its prey,
+    independently for each patch. Then r = q^n for a prey with n patches, so r ≈ q^F.
+  - This gives f(S, F) = 1 − q^F/(1 − S/S_c).
+  - *Caveat:* the mean of q^n is not q to the mean of n.
+  - q is really q(F, p): other species' ground and blocked sites both stop sweeps.
+- **The F equation, derived by the user:**
+  - ΔF = (ΔP − F·ΔS)/S, by the quotient rule. A newcomer (ΔP = ΔS = 1) gives (1 − F)/S, so it pulls
+    F toward 1 (300/100 → 301/101).
+  - ΔP = 1 − c + G − E: one patch from the newcomer, one lost per extinction, islands made (G) and
+    islands eaten (E).
+  - Together: **ΔS = 1 − c, ΔF = [(1 − c)(1 − F) + G − E]/S**, with c = q^F/(1 − S/S_c).
+  - Growth in S dilutes F, through the first term.
+- **G, islands made:**
+  - First form: (1 − q^F)/(1 − S/S_c), the failed sweeps.
+  - The user saw that one failed sweep can leave several pockets. Hence G = b·(1 − q^F)/(1 − S/S_c),
+    with b ≥ 1 the new patches per failed sweep.
+  - A *missed* existing patch adds no patch. Only a *broken* patch does, as in the A → B → C pockets
+    of D13. Strictly, G needs its own chance of leaving pockets, separate from the miss rate 1 − q.
+- **E, islands eaten:**
+  - First form: (F − 1)·S·(1 − (1 − γ)^k), with I = (F − 1)·S islands and k neighbours each.
+  - The user saw that it overcounts on a mostly frozen lattice (D14). A surviving island has no
+    neighbour that can invade it. It can only be eaten by a new neighbour, which means by a sweep of
+    the current arrival.
+  - Hence E ≈ γ·j(F)/(1 − S/S_c), with j(F) the islands bordering one sweep's ground; j counts
+    islands, not species.
+  - Islands of one species are decided by one link. That leaves the mean unchanged but makes losses
+    lumpier, with a larger variance and jumps in F.
+  - *To check:* a species' last island eaten is an extinction, which may already be in c.
+- **The feedback:**
+  - Fragmentation feeds itself: F ↑ → r ↓ → more island-leaving sweeps → F ↑. Run backwards, it
+    consolidates the lattice toward F = 1.
+  - The brake is erosion by new neighbours.
+  - Both G and E scale with the cascade size, so G − E ≈ [b(1 − q^F) − γ·j(F)]/(1 − S/S_c). Whether
+    sweeps fragment or tidy up on balance depends on F alone.
+- **The S-nullcline and the low state:**
+  - ΔS = 0 gives F = ln(1 − S/S_c)/ln q. It rises with S and diverges at S_c: a higher S needs a
+    more fragmented lattice. Above the curve S grows; below it S shrinks.
+  - Where it crosses F = 1: **S_low = S_c(1 − q)**, a low state that is not absorbing (unlike the
+    toy of 19 Nov).
+  - With S_c ≈ 110 (γ = 0.03, r_min = 0.1), S_low ≈ 3 needs q ≈ 0.97, a miss rate of about 3%. The
+    low state is set by the miss rate.
+- **Prediction for p:**
+  - Blocked sites lower q and raise b. S_low should then rise with p while S_high falls (D21), so
+    the barrier closes.
+  - This fits low states of 3–5 species at p ≤ 0.1, flickering at p = 0.35, and 11–16 species with
+    one state at p = 0.4. It is a candidate for the upper edge of the p window.
+- **Still open:**
+  - the F-nullcline;
+  - j(F) and b, and the chance of leaving pockets;
+  - possible double counting between c and E;
+  - the phase plane;
+  - measuring q(p) and b(p) per sweep in the simulations.
+
 ---
 
 ## 2. Register of discoveries
@@ -985,6 +1101,12 @@ diverse state. D17 agrees with Uekermann et al. (2017), for whom γ sets which s
     ΔU = ∫ 2|f|/σ² dS and τ ∝ e^(ΔU), was worked through up to the waiting time (see the 16:06
     entry). *19 Nov:* the waiting time is done. Dwell times are memoryless with mean τ = C⁻¹·e^(ΔU),
     and the escape lasts N* = d/f ≪ τ, which would make switches sharp (see the 19 Nov entry).
+    *22–25 Nov:* the skew of single arrivals should make collapses easier than e^(−ΔU) predicts and
+    rises a gradual climb. *Test:* ΔS per arrival in each state, and the shape of S(t) in many
+    switches (see the 22–25 Nov entry). *25 Nov:* a two-variable version with F = P/S,
+    r = q^F and an F equation from islands made and eaten. It predicts a low state
+    S_low = S_c(1 − q) and a barrier that closes as p rises. *Test:* measure q(p) and b(p) per sweep
+    (see the 25 Nov entry).
 
 ---
 
